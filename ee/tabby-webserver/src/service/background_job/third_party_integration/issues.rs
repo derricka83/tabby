@@ -2,11 +2,14 @@ use anyhow::{anyhow, Result};
 use async_stream::stream;
 use chrono::{DateTime, Utc};
 use futures::Stream;
-use gitlab::api::{issues::ProjectIssues, projects::merge_requests::MergeRequests, AsyncQuery};
+use gitlab::api::{issues::ProjectIssues, AsyncQuery};
 use octocrab::Octocrab;
 use serde::Deserialize;
-use tabby_index::public::WebDocument;
+use tabby_index::public::{
+    StructuredDoc, StructuredDocFields, StructuredDocIssueFields, StructuredDocState,
+};
 
+use super::error::octocrab_error_message;
 use crate::service::create_gitlab_client;
 
 pub async fn list_github_issues(
@@ -14,7 +17,7 @@ pub async fn list_github_issues(
     api_base: &str,
     full_name: &str,
     access_token: &str,
-) -> Result<impl Stream<Item = (DateTime<Utc>, WebDocument)>> {
+) -> Result<impl Stream<Item = (StructuredDocState, StructuredDoc)>> {
     let octocrab = Octocrab::builder()
         .personal_token(access_token.to_string())
         .base_uri(api_base)?
@@ -39,7 +42,7 @@ pub async fn list_github_issues(
                 .await {
                     Ok(x) => x,
                     Err(e) => {
-                        logkit::error!("Failed to fetch issues: {}", e);
+                        logkit::error!("Failed to fetch issues: {}",  octocrab_error_message(e));
                         break;
                     }
             };
@@ -47,14 +50,27 @@ pub async fn list_github_issues(
             let pages = response.number_of_pages().unwrap_or_default();
 
             for issue in response.items {
-                let doc = WebDocument {
+                // pull request is also an issue in GitHub,
+                // skip them here
+                if issue.pull_request.is_some() {
+                    continue;
+                }
+
+                let doc = StructuredDoc {
                     source_id: source_id.to_string(),
-                    id: issue.html_url.to_string(),
-                    link: issue.html_url.to_string(),
-                    title: issue.title,
-                    body: issue.body.unwrap_or_default(),
+                    fields: StructuredDocFields::Issue(StructuredDocIssueFields {
+                        link: issue.html_url.to_string(),
+                        title: issue.title,
+                        author_email: issue.user.email,
+                        body: issue.body.unwrap_or_default(),
+                        closed: issue.state == octocrab::models::IssueState::Closed,
+                    })
                 };
-                yield (issue.updated_at, doc);
+                yield (StructuredDocState {
+                    id: doc.id().to_string(),
+                    updated_at: issue.updated_at,
+                    deleted: false,
+                }, doc);
             }
 
             page += 1;
@@ -70,9 +86,16 @@ pub async fn list_github_issues(
 #[derive(Deserialize)]
 struct GitlabIssue {
     title: String,
+    author: GitlabAuthor,
     description: Option<String>,
     web_url: String,
     updated_at: DateTime<Utc>,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct GitlabAuthor {
+    public_email: Option<String>,
 }
 
 pub async fn list_gitlab_issues(
@@ -80,7 +103,7 @@ pub async fn list_gitlab_issues(
     api_base: &str,
     full_name: &str,
     access_token: &str,
-) -> Result<impl Stream<Item = (DateTime<Utc>, WebDocument)>> {
+) -> Result<impl Stream<Item = (StructuredDocState, StructuredDoc)>> {
     let gitlab = create_gitlab_client(api_base, access_token).await?;
 
     let source_id = source_id.to_owned();
@@ -101,40 +124,21 @@ pub async fn list_gitlab_issues(
         };
 
         for issue in issues {
-            let doc = WebDocument {
+            let doc = StructuredDoc {
                 source_id: source_id.to_owned(),
-                id: issue.web_url.clone(),
+                fields: StructuredDocFields::Issue(StructuredDocIssueFields {
                 link: issue.web_url,
+                author_email: issue.author.public_email,
                 title: issue.title,
                 body: issue.description.unwrap_or_default(),
-            };
-            yield (issue.updated_at, doc);
+                closed: issue.state == "closed",
+            })};
+            yield (StructuredDocState {
+                id: doc.id().to_string(),
+                updated_at: issue.updated_at,
+                deleted: false,
+            }, doc);
         }
-
-        let merge_requests: Vec<GitlabIssue> = match gitlab::api::paged(
-            MergeRequests::builder().project(&full_name).build().expect("Failed to build request"),
-            gitlab::api::Pagination::All,
-        )
-        .query_async(&gitlab)
-        .await {
-            Ok(x) => x,
-            Err(e) => {
-                logkit::error!("Failed to fetch merge requests: {}", e);
-                return;
-            }
-        };
-
-        for merge_request in merge_requests {
-            let doc = WebDocument {
-                source_id: source_id.to_owned(),
-                id: merge_request.web_url.clone(),
-                link: merge_request.web_url,
-                title: merge_request.title,
-                body: merge_request.description.unwrap_or_default(),
-            };
-            yield (merge_request.updated_at, doc);
-        }
-
     };
 
     Ok(s)

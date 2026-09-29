@@ -16,8 +16,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow_ref }}-${{ github.head_ref || github.ref_name }} 
-  
+  group: ${{ github.workflow_ref }}-${{ github.head_ref || github.ref_name }}
+
   # If this is enabled it will cancel current running and start latest
   cancel-in-progress: true
 
@@ -41,22 +41,20 @@ jobs:
           components: rustfmt, clippy
 
       - name: Sccache cache
-        uses: mozilla-actions/sccache-action@v0.0.3
-        with:
-          version: "v0.4.0"
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install cargo-machete
         uses: actions-rs/cargo@v1
         with:
           command: install
-          args: cargo-machete
+          args: --version 0.7.0 cargo-machete
 
       - name: Cargo registry cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}-${{ github.sha }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-${{ github.sha }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}-
+            cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}-
             cargo-${{ runner.os }}-
           path: |
             ~/.cargo/registry
@@ -68,4 +66,4 @@ jobs:
 
       - run: make update-graphql-schema
 
-      - uses: autofix-ci/action@d3e591514b99d0fca6779455ff8338516663f7cc
+      - uses: autofix-ci/action@551dded8c6cc8a1054039c8bc0b8b48c51dfc6ef

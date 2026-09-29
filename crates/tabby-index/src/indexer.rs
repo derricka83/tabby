@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
-use anyhow::bail;
+use anyhow::{bail, Result};
 use async_stream::stream;
 use futures::{stream::BoxStream, Stream, StreamExt};
 use serde_json::json;
 use tabby_common::{
-    index::{IndexSchema, FIELD_SOURCE_ID},
+    index::{structured_doc::fields::KIND, IndexSchema, FIELD_SOURCE_ID},
     path,
 };
 use tantivy::{
@@ -17,14 +17,15 @@ use tantivy::{
     collector::TopDocs,
     doc,
     query::AllQuery,
-    schema::{self, Value},
-    DocAddress, DocSet, IndexWriter, Searcher, TantivyDocument, Term, TERMINATED,
+    schema::{self, document::CompactDocValue, Value},
+    DateTime, DocAddress, DocSet, IndexWriter, Searcher, TantivyDocument, Term, TERMINATED,
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, warn};
 
 use crate::tantivy_utils::open_or_create_index;
 
+#[derive(Debug)]
 pub struct IndexId {
     pub source_id: String,
     pub id: String,
@@ -36,11 +37,14 @@ pub trait ToIndexId {
 
 #[async_trait::async_trait]
 pub trait IndexAttributeBuilder<T>: Send + Sync {
+    /// Build document level attributes, these attributes are only stored but not indexed.
     async fn build_attributes(&self, document: &T) -> serde_json::Value;
-    async fn build_chunk_attributes(
+
+    /// Build chunk level attributes, these attributes are stored and indexed.
+    async fn build_chunk_attributes<'a>(
         &self,
-        document: &T,
-    ) -> BoxStream<JoinHandle<(Vec<String>, serde_json::Value)>>;
+        document: &'a T,
+    ) -> BoxStream<'a, JoinHandle<Result<(Vec<String>, serde_json::Value)>>>;
 }
 
 pub struct TantivyDocBuilder<T> {
@@ -69,21 +73,60 @@ impl<T: ToIndexId> TantivyDocBuilder<T> {
         let now = tantivy::time::OffsetDateTime::now_utc();
         let updated_at = tantivy::DateTime::from_utc(now);
 
-        let doc = doc! {
-            schema.field_id => id,
-            schema.field_source_id => source_id,
-            schema.field_corpus => self.corpus,
-            schema.field_attributes => self.builder.build_attributes(&document).await,
-            schema.field_updated_at => updated_at,
-        };
-
         let cloned_id = id.clone();
+        let doc_id = id.clone();
+        let doc_attributes = self.builder.build_attributes(&document).await;
         let s = stream! {
-            yield tokio::spawn(async move { Some(doc) });
+            let (tx, mut rx) = mpsc::channel(32);
 
-            for await doc in self.build_chunks(cloned_id, source_id, updated_at, document).await {
-                yield doc;
-            }
+            for await chunk_doc in self.build_chunks(cloned_id, source_id.clone(), updated_at, document).await {
+                let tx = tx.clone();
+                let doc_id = doc_id.clone();
+                yield tokio::spawn(async move {
+                    match chunk_doc.await {
+                        Ok(Ok(doc)) => {
+                            Some(doc)
+                        }
+                        Ok(Err(e)) => {
+                            warn!("Failed to build chunk for document '{}': {}", doc_id, e);
+                            tx.send(()).await.unwrap_or_else(|e| {
+                                warn!("Failed to send error signal for document '{}': {}", doc_id, e);
+                            });
+                            None
+                        }
+                        Err(e) => {
+                            warn!("Failed to call build chunk '{}': {}", doc_id, e);
+                            tx.send(()).await.unwrap_or_else(|e| {
+                                warn!("Failed to send error signal for document '{}': {}", doc_id, e);
+                            });
+                            None
+                        }
+                    }
+                });
+            };
+
+            // drop tx to signal the end of the stream
+            // the cloned is dropped in its own thread
+            drop(tx);
+
+            let mut doc = doc! {
+                schema.field_id => doc_id,
+                schema.field_source_id => source_id,
+                schema.field_corpus => self.corpus,
+                schema.field_attributes => doc_attributes,
+                schema.field_updated_at => updated_at,
+            };
+
+            yield tokio::spawn(async move {
+                let mut failed_count = 0;
+                while (rx.recv().await).is_some() {
+                    failed_count += 1;
+                }
+                if failed_count > 0 {
+                    doc.add_u64(schema.field_failed_chunks_count, failed_count as u64);
+                }
+                Some(doc)
+             });
         };
 
         (id, s)
@@ -95,7 +138,7 @@ impl<T: ToIndexId> TantivyDocBuilder<T> {
         source_id: String,
         updated_at: tantivy::DateTime,
         document: T,
-    ) -> impl Stream<Item = JoinHandle<Option<TantivyDocument>>> + '_ {
+    ) -> impl Stream<Item = JoinHandle<Result<TantivyDocument>>> + '_ {
         let kind = self.corpus;
         stream! {
             let schema = IndexSchema::instance();
@@ -104,9 +147,8 @@ impl<T: ToIndexId> TantivyDocBuilder<T> {
                 let source_id = source_id.clone();
 
                 yield tokio::spawn(async move {
-                    let Ok((tokens, chunk_attributes)) = task.await else {
-                        return None;
-                    };
+                    let built_chunk_attributes_result = task.await?;
+                    let (tokens, chunk_attributes) = built_chunk_attributes_result?;
 
                     let mut doc = doc! {
                         schema.field_id => id,
@@ -117,14 +159,34 @@ impl<T: ToIndexId> TantivyDocBuilder<T> {
                         schema.field_chunk_attributes => chunk_attributes,
                     };
 
-                    for token in tokens {
+                    for token in &tokens {
                         doc.add_text(schema.field_chunk_tokens, token);
                     }
 
-                    Some(doc)
+                    Ok(doc)
                 });
             }
         }
+    }
+
+    pub async fn backfill_doc_attributes(
+        &self,
+        origin: &TantivyDocument,
+        doc: &T,
+    ) -> TantivyDocument {
+        let schema = IndexSchema::instance();
+        let mut doc = doc! {
+            schema.field_id => get_text(origin, schema.field_id),
+            schema.field_source_id => get_text(origin, schema.field_source_id).to_string(),
+            schema.field_corpus => get_text(origin, schema.field_corpus).to_string(),
+            schema.field_attributes => self.builder.build_attributes(doc).await,
+            schema.field_updated_at => get_date(origin, schema.field_updated_at),
+        };
+        if let Some(failed_chunks) = get_number_optional(origin, schema.field_failed_chunks_count) {
+            doc.add_u64(schema.field_failed_chunks_count, failed_chunks as u64);
+        }
+
+        doc
     }
 }
 
@@ -156,11 +218,100 @@ impl Indexer {
             .expect("Failed to add document");
     }
 
+    pub async fn get_doc(&self, id: &str) -> Result<TantivyDocument> {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_query(&self.corpus, id);
+        let docs = match self.searcher.search(&query, &TopDocs::with_limit(1)) {
+            Ok(docs) => docs,
+            Err(e) => {
+                debug!("query tantivy error: {}", e);
+                return Err(e.into());
+            }
+        };
+        if docs.is_empty() {
+            bail!("Document not found: {}", id);
+        }
+
+        self.searcher
+            .doc(docs.first().unwrap().1)
+            .map_err(|e| e.into())
+    }
+
+    // `get_doc_kind` returns the kind of a structured_doc, and `None` for a code.
+    pub async fn get_doc_kind<'a>(&self, id: &str) -> Result<Option<String>> {
+        let doc = self.get_doc(id).await?;
+        let schema = IndexSchema::instance();
+        Ok(get_json_text_optional(&doc, schema.field_attributes, KIND).map(|v| v.to_owned()))
+    }
+
+    /// Lists the latest document IDs based on the given source ID, key-value pairs, and datetime field.
+    ///
+    /// The IDs are sorted by the datetime field in descending order and filtered by the given constraints.
+    pub async fn list_latest_ids(
+        &self,
+        source_id: &str,
+        kvs: &Vec<(&str, &str)>,
+        datetime_field: &str,
+        offset: usize,
+    ) -> Result<Vec<String>> {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_with_attribute_field(&self.corpus, source_id, kvs);
+        let docs = match self
+            .searcher
+            .search(&query, &TopDocs::with_limit(u16::MAX as usize))
+        {
+            Ok(docs) => docs,
+            Err(e) => {
+                debug!("query tantivy error: {}", e);
+                return Err(e.into());
+            }
+        };
+        if docs.is_empty() {
+            bail!("No document found: {:?}", kvs);
+        }
+
+        let mut documents = Vec::new();
+        for (_, doc_address) in docs {
+            let doc: TantivyDocument = self.searcher.doc(doc_address)?;
+            documents.push((
+                get_text(&doc, schema.field_id).to_owned(),
+                get_json_date_field(&doc, schema.field_attributes, datetime_field),
+            ));
+        }
+
+        documents.sort_by(|a, b| b.1.cmp(&a.1));
+
+        Ok(documents
+            .iter()
+            .skip(offset)
+            .map(|(id, _)| id.to_owned())
+            .collect())
+    }
+
+    pub async fn count_doc_by_attribute(
+        &self,
+        source_id: &str,
+        kvs: &Vec<(&str, &str)>,
+    ) -> Result<usize> {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_with_attribute_field(&self.corpus, source_id, kvs);
+
+        let count = self.searcher.search(&query, &tantivy::collector::Count)?;
+        Ok(count)
+    }
+
     pub fn delete(&self, id: &str) {
         let schema = IndexSchema::instance();
         let _ = self
             .writer
             .delete_query(Box::new(schema.doc_query_with_chunks(&self.corpus, id)));
+    }
+
+    pub fn delete_doc(&self, id: &str) {
+        let schema = IndexSchema::instance();
+        let _ = self
+            .writer
+            .delete_query(Box::new(schema.doc_query(&self.corpus, id)));
     }
 
     pub fn commit(mut self) {
@@ -181,7 +332,7 @@ impl Indexer {
     }
 
     /// Iterates over all the document IDs in the corpus.
-    pub fn iter_ids(&self) -> impl Stream<Item = String> + '_ {
+    pub fn iter_ids(&self) -> impl Stream<Item = (String, String)> + '_ {
         let schema = IndexSchema::instance();
 
         stream! {
@@ -205,7 +356,8 @@ impl Indexer {
                         // Skip chunks, as we only want to iterate over the main docs
                         if doc.get_first(schema.field_chunk_id).is_none() {
                             let id = get_text(&doc, schema.field_id);
-                            yield id.to_owned();
+                            let source = get_text(&doc, schema.field_source_id);
+                            yield (source.to_owned(), id.to_owned());
                         }
                     }
                     doc_id = postings.advance();
@@ -222,6 +374,32 @@ impl Indexer {
         };
 
         !docs.is_empty()
+    }
+
+    /// Check whether the document has failed chunks.
+    ///
+    /// failed chunks tracks the number of embedding indexing failed chunks for a document.
+    pub fn has_failed_chunks(&self, id: &str) -> bool {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_has_failed_chunks(&self.corpus, id);
+        let Ok(docs) = self.searcher.search(&query, &TopDocs::with_limit(1)) else {
+            return false;
+        };
+
+        !docs.is_empty()
+    }
+
+    // Check whether the document has attribute field.
+    pub fn has_attribute_field(&self, id: &str, field: &str) -> bool {
+        let schema = IndexSchema::instance();
+        let query = schema.doc_has_attribute_field(&self.corpus, id, field);
+        match self.searcher.search(&query, &TopDocs::with_limit(1)) {
+            Ok(docs) => !docs.is_empty(),
+            Err(e) => {
+                debug!("query tantivy error: {}", e);
+                false
+            }
+        }
     }
 }
 
@@ -301,4 +479,51 @@ impl IndexGarbageCollector {
 
 fn get_text(doc: &TantivyDocument, field: schema::Field) -> &str {
     doc.get_first(field).unwrap().as_str().unwrap()
+}
+
+fn get_date(doc: &TantivyDocument, field: schema::Field) -> tantivy::DateTime {
+    doc.get_first(field).unwrap().as_datetime().unwrap()
+}
+
+fn get_number_optional(doc: &TantivyDocument, field: schema::Field) -> Option<i64> {
+    doc.get_first(field)?.as_i64()
+}
+
+fn get_json_field<'a>(
+    doc: &'a TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> CompactDocValue<'a> {
+    doc.get_first(field)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .find(|(k, _)| *k == name)
+        .unwrap()
+        .1
+}
+
+fn get_json_date_field(doc: &TantivyDocument, field: schema::Field, name: &str) -> DateTime {
+    get_json_field(doc, field, name).as_datetime().unwrap()
+}
+
+fn get_json_field_optional<'a>(
+    doc: &'a TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> Option<CompactDocValue<'a>> {
+    Some(
+        doc.get_first(field)?
+            .as_object()?
+            .find(|(k, _)| *k == name)?
+            .1,
+    )
+}
+
+fn get_json_text_optional<'a>(
+    doc: &'a TantivyDocument,
+    field: schema::Field,
+    name: &str,
+) -> Option<&'a str> {
+    get_json_field_optional(doc, field, name).map(|v| v.as_str().unwrap())
 }

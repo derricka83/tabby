@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use juniper::ID;
@@ -8,7 +10,7 @@ use tabby_schema::{
 };
 
 use super::graphql_pagination_to_filter;
-use crate::service::background_job::BackgroundJobEvent;
+use crate::{path::background_jobs_dir, service::background_job::BackgroundJobEvent};
 
 struct JobControllerImpl {
     db: DbConn,
@@ -57,19 +59,31 @@ impl JobService for JobControllerImpl {
                 .filter_map(|x| x.as_rowid().ok().map(|x| x as i32))
                 .collect()
         });
-        Ok(self
+
+        let jobs: Vec<JobRun> = self
             .db
             .list_job_runs_with_filter(rowids, jobs, limit, skip_id, backwards)
             .await?
             .into_iter()
             .map(Into::into)
-            .collect())
+            .collect();
+
+        Ok(jobs)
     }
 
     async fn get_job_info(&self, command: String) -> Result<JobInfo> {
-        let job_run = self.db.get_latest_job_run(command.clone()).await;
+        let job_run: JobRun = match self.db.get_latest_job_run(command.clone()).await {
+            Some(job) => job.into(),
+            None => {
+                return Ok(JobInfo {
+                    last_job_run: None,
+                    command,
+                })
+            }
+        };
+
         Ok(JobInfo {
-            last_job_run: job_run.map(JobRun::from),
+            last_job_run: Some(job_run),
             command,
         })
     }
@@ -81,6 +95,21 @@ impl JobService for JobControllerImpl {
             failed: stats.failed,
             pending: stats.pending,
         })
+    }
+
+    async fn log_file_path(&self, id: &ID) -> Option<PathBuf> {
+        match self.db.get_job_run(id.as_rowid().ok()?).await {
+            Some(_) => {
+                let job_dir_path = background_jobs_dir()
+                    .join(format!("{id}"))
+                    .join("stdout.log");
+                match tokio::fs::metadata(&job_dir_path).await {
+                    Ok(_) => return Some(job_dir_path),
+                    Err(_) => return None,
+                }
+            }
+            None => None, // Job not found
+        }
     }
 }
 

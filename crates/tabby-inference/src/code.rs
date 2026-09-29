@@ -5,7 +5,9 @@ use derive_builder::Builder;
 use futures::StreamExt;
 use tabby_common::{config::ModelConfig, languages::Language};
 
-use crate::{decoding::StopConditionFactory, CompletionOptionsBuilder, CompletionStream};
+use crate::{
+    clip_prompt, decoding::StopConditionFactory, CompletionOptionsBuilder, CompletionStream,
+};
 
 #[derive(Builder, Debug)]
 pub struct CodeGenerationOptions {
@@ -23,8 +25,14 @@ pub struct CodeGenerationOptions {
 
     #[builder(default = "None")]
     pub language: Option<&'static Language>,
+
+    #[builder(default = "\"standard\".to_string()")]
+    pub mode: String,
 }
 
+/// CodeGeneration utilizes the CompletionStream to generate code completions.
+/// It employs the StopConditionFactory to maintain a list of stop conditions by language, then
+/// reads and decodes the stream, ceasing code generation when a stop condition is met.
 pub struct CodeGeneration {
     imp: Arc<dyn CompletionStream>,
     stop_condition_factory: StopConditionFactory,
@@ -48,6 +56,26 @@ impl CodeGeneration {
 
 impl CodeGeneration {
     pub async fn generate(&self, prompt: &str, options: CodeGenerationOptions) -> String {
+        // Clip prompt by options.max_input_length (truncate from beginning)
+        let prompt = if options.max_input_length > 0 {
+            clip_prompt(prompt, options.max_input_length)
+        } else {
+            prompt
+        };
+
+        let completion_options = CompletionOptionsBuilder::default()
+            .max_decoding_tokens(options.max_decoding_tokens)
+            .sampling_temperature(options.sampling_temperature)
+            .seed(options.seed)
+            .build()
+            .expect("Failed to build completion options");
+
+        if options.mode == "next_edit_suggestion" {
+            tracing::debug!("Using generate_sync for next_edit_suggestion mode");
+            return self.imp.generate_sync(prompt, completion_options).await;
+        }
+
+        // For standard mode, use streaming with stop conditions
         let s = stream! {
             let mut text = String::new();
             let mut stop_condition = self.stop_condition_factory.create(
@@ -55,15 +83,7 @@ impl CodeGeneration {
                 options.language,
             );
 
-            let options = CompletionOptionsBuilder::default()
-                .max_input_length(options.max_input_length)
-                .max_decoding_tokens(options.max_decoding_tokens)
-                .sampling_temperature(options.sampling_temperature)
-                .seed(options.seed)
-                .build()
-                .expect("Failed to build completion options");
-
-            for await new_text in self.imp.generate(prompt, options).await {
+            for await new_text in self.imp.generate(prompt, completion_options).await {
                 let (should_stop, stop_length) = stop_condition.should_stop(&new_text);
                 text += &new_text;
                 if should_stop {

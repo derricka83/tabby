@@ -9,8 +9,10 @@ import {
   CodeLensParams,
 } from "vscode-languageserver";
 import { ClientCapabilities, ServerCapabilities, CodeLens, CodeLensType, ChangesPreviewLineType } from "./protocol";
-import { TextDocuments } from "./lsp/textDocuments";
+import { TextDocuments } from "./extensions/textDocuments";
 import { TextDocument } from "vscode-languageserver-textdocument";
+import { getLogger } from "./logger";
+import { codeDiff } from "./utils/diff";
 
 const codeLensType: CodeLensType = "previewChanges";
 const changesPreviewLineType = {
@@ -24,6 +26,8 @@ const changesPreviewLineType = {
   inserted: "inserted" as ChangesPreviewLineType,
   deleted: "deleted" as ChangesPreviewLineType,
 };
+
+const logger = getLogger("CodeLensProvider");
 
 export class CodeLensProvider implements Feature {
   constructor(private readonly documents: TextDocuments<TextDocument>) {}
@@ -57,6 +61,10 @@ export class CodeLensProvider implements Feature {
     const codeLenses: CodeLens[] = [];
     let lineInPreviewBlock = -1;
     let previewBlockMarkers = "";
+    const originLines: string[] = [];
+    const modifiedLines: string[] = [];
+    const modifiedCodeLenses: CodeLens[] = [];
+    const originCodeLenses: CodeLens[] = [];
     for (let line = textDocument.lineCount - 1; line >= 0; line = line - 1) {
       if (token.isCancellationRequested) {
         return null;
@@ -91,7 +99,7 @@ export class CodeLensProvider implements Feature {
         if (match && editId) {
           lineInPreviewBlock = -1;
 
-          if (previewBlockMarkers.includes(".")) {
+          if (previewBlockMarkers.includes(".") || previewBlockMarkers.includes("|")) {
             lineCodeLenses.push({
               range: codeLensRange,
               command: {
@@ -115,7 +123,7 @@ export class CodeLensProvider implements Feature {
                 line: changesPreviewLineType.header,
               },
             });
-          } else if (!previewBlockMarkers.includes("x")) {
+          } else {
             lineCodeLenses.push({
               range: codeLensRange,
               command: {
@@ -166,6 +174,10 @@ export class CodeLensProvider implements Feature {
                   line: changesPreviewLineType.waiting,
                 },
               };
+              originLines.unshift(text);
+              originCodeLenses.unshift(codeLens);
+              modifiedLines.unshift(text);
+              modifiedCodeLenses.unshift(codeLens);
               break;
             case "|":
               codeLens = {
@@ -175,6 +187,8 @@ export class CodeLensProvider implements Feature {
                   line: changesPreviewLineType.inProgress,
                 },
               };
+              modifiedLines.unshift(text);
+              modifiedCodeLenses.unshift(codeLens);
               break;
             case "=":
               codeLens = {
@@ -184,6 +198,10 @@ export class CodeLensProvider implements Feature {
                   line: changesPreviewLineType.unchanged,
                 },
               };
+              originLines.unshift(text);
+              originCodeLenses.unshift(codeLens);
+              modifiedLines.unshift(text);
+              modifiedCodeLenses.unshift(codeLens);
               break;
             case "+":
               codeLens = {
@@ -193,6 +211,8 @@ export class CodeLensProvider implements Feature {
                   line: changesPreviewLineType.inserted,
                 },
               };
+              modifiedLines.unshift(text);
+              modifiedCodeLenses.unshift(codeLens);
               break;
             case "-":
               codeLens = {
@@ -202,6 +222,8 @@ export class CodeLensProvider implements Feature {
                   line: changesPreviewLineType.deleted,
                 },
               };
+              originLines.unshift(text);
+              originCodeLenses.unshift(codeLens);
               break;
             default:
               break;
@@ -219,6 +241,45 @@ export class CodeLensProvider implements Feature {
         }
       }
     }
+
+    // if origin and modified lines are not empty, compute the char diffs.
+    // otherwise, it is just an insertion or deletion, skipping char diffs.
+    if (originLines.length > 0 && modifiedLines.length > 0) {
+      const { originRanges, modifiedRanges } = codeDiff(
+        originLines,
+        originCodeLenses.map((item) => item.range),
+        modifiedLines,
+        modifiedCodeLenses.map((item) => item.range),
+      );
+      const deletionDecorations = originRanges.map((range) => {
+        return {
+          range,
+          data: {
+            type: codeLensType,
+            text: "deleted" as const,
+          },
+        };
+      });
+
+      const insertionDecorations = modifiedRanges.map((range) => {
+        return {
+          range,
+          data: {
+            type: codeLensType,
+            text: "inserted" as const,
+          },
+        };
+      });
+
+      if (resultProgress) {
+        resultProgress.report([...deletionDecorations, ...insertionDecorations]);
+      } else {
+        codeLenses.push(...deletionDecorations, ...insertionDecorations);
+      }
+    }
+
+    logger.debug(`codeLenses: ${JSON.stringify(codeLenses)}`);
+
     workDoneProgress?.done();
     if (resultProgress) {
       return null;

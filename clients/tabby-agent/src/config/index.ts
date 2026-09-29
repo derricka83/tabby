@@ -32,6 +32,8 @@ const mergeFunction = deepmergeCustom({
       const nonBlankStringValues = values.filter((value) => typeof value === "string" && !isBlank(value));
       if (nonBlankStringValues.length > 0) {
         return utils.defaultMergeFunctions.mergeOthers(nonBlankStringValues);
+      } else {
+        return "";
       }
     }
     return utils.actions.defaultMerge;
@@ -60,6 +62,12 @@ function mergeConfig(
     serverProvidedConfig.anonymousUsageTracking = { disable: true };
   }
   const merged = mergeFunction(base, configFileConfig, clientProvidedConfig, serverProvidedConfig) as ConfigData;
+
+  // remove trailing slash from endpoint
+  if (merged.server.endpoint) {
+    merged.server.endpoint = merged.server.endpoint.replace(/\/+$/, "");
+  }
+
   return merged;
 }
 
@@ -74,9 +82,10 @@ export class Configurations extends EventEmitter implements Feature {
 
   private configForLsp: TabbyLspConfig = { server: defaultConfigData["server"] }; // config for lsp client
 
+  private lspConnection: Connection | undefined = undefined;
   private clientCapabilities: ClientCapabilities | undefined = undefined;
 
-  constructor(private readonly dataStore?: DataStore) {
+  constructor(private readonly dataStore: DataStore) {
     super();
   }
 
@@ -109,24 +118,20 @@ export class Configurations extends EventEmitter implements Feature {
       const configFile = this.configFile;
       await configFile.load();
       configFile.on("updated", async () => {
-        if (this.dataStore) {
-          this.serverProvided = this.pickStoredServerProvidedConfig(this.dataStore.data);
-        }
+        this.serverProvided = this.pickStoredServerProvidedConfig(this.dataStore.data);
         this.update();
       });
       configFile.watch();
     }
 
-    if (this.dataStore) {
-      this.serverProvided = this.pickStoredServerProvidedConfig(this.dataStore.data);
-      this.dataStore.on("updated", async (data: Partial<StoredData>) => {
-        const serverProvidedConfig = this.pickStoredServerProvidedConfig(data);
-        if (!deepEqual(serverProvidedConfig, this.serverProvided)) {
-          this.serverProvided = serverProvidedConfig;
-          this.update();
-        }
-      });
-    }
+    this.serverProvided = this.pickStoredServerProvidedConfig(this.dataStore.data);
+    this.dataStore.on("updated", async (data: Partial<StoredData>) => {
+      const serverProvidedConfig = this.pickStoredServerProvidedConfig(data);
+      if (!deepEqual(serverProvidedConfig, this.serverProvided)) {
+        this.serverProvided = serverProvidedConfig;
+        this.update();
+      }
+    });
 
     this.update();
   }
@@ -136,6 +141,7 @@ export class Configurations extends EventEmitter implements Feature {
     clientCapabilities: ClientCapabilities,
     clientProvidedConfig: ClientProvidedConfig,
   ): Promise<ServerCapabilities> {
+    this.lspConnection = connection;
     this.clientCapabilities = clientCapabilities;
 
     this.updateClientProvidedConfig(clientProvidedConfig);
@@ -174,14 +180,21 @@ export class Configurations extends EventEmitter implements Feature {
     return this.configForLsp;
   }
 
-  updateClientProvidedConfig(config: ClientProvidedConfig) {
+  async refreshClientProvidedConfig(): Promise<boolean> {
+    if (this.lspConnection && this.clientCapabilities?.workspace?.configuration) {
+      const config = await this.lspConnection.workspace.getConfiguration();
+      this.updateClientProvidedConfig(config);
+      return true;
+    }
+    return false;
+  }
+
+  private updateClientProvidedConfig(config: ClientProvidedConfig) {
     if (!deepEqual(config, this.clientProvided)) {
       const old = this.clientProvided;
       this.clientProvided = config;
       this.emit("clientProvidedConfigUpdated", config, old);
-      if (this.dataStore) {
-        this.serverProvided = this.pickStoredServerProvidedConfig(this.dataStore.data);
-      }
+      this.serverProvided = this.pickStoredServerProvidedConfig(this.dataStore.data);
       this.update();
     }
   }
@@ -191,7 +204,7 @@ export class Configurations extends EventEmitter implements Feature {
       this.serverProvided = config;
       this.update();
     }
-    if (save && this.dataStore) {
+    if (save) {
       const mergedLocalConfig = mergeConfig(this.defaultConfig, this.configFile, this.clientProvided);
       const serverEndpoint = mergedLocalConfig.server.endpoint;
       if (!this.dataStore.data.serverConfig) {

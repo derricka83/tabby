@@ -1,16 +1,16 @@
 mod supervisor;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use async_openai::error::OpenAIError;
+use async_openai_alt::error::OpenAIError;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::Deserialize;
 use supervisor::LlamaCppSupervisor;
 use tabby_common::{
-    config::{HttpModelConfigBuilder, LocalModelConfig, ModelConfig},
-    registry::{parse_model_id, ModelRegistry, GGML_MODEL_RELATIVE_PATH},
+    config::{HttpModelConfigBuilder, LocalModelConfig, ModelConfig, RateLimit, RateLimitBuilder},
+    registry::{parse_model_id, ModelRegistry, GGML_MODEL_PARTITIONED_PREFIX},
 };
 use tabby_inference::{ChatCompletionStream, CompletionOptions, CompletionStream, Embedding};
 
@@ -46,6 +46,7 @@ impl EmbeddingServer {
 
         let config = HttpModelConfigBuilder::default()
             .api_endpoint(Some(api_endpoint(server.port())))
+            .rate_limit(build_rate_limit_config())
             .kind("llama.cpp/embedding".to_string())
             .build()
             .expect("Failed to create HttpModelConfig");
@@ -95,6 +96,7 @@ impl CompletionServer {
     async fn new_with_supervisor(server: Arc<LlamaCppSupervisor>) -> Self {
         let config = HttpModelConfigBuilder::default()
             .api_endpoint(Some(api_endpoint(server.port())))
+            .rate_limit(build_rate_limit_config())
             .kind("llama.cpp/completion".to_string())
             .build()
             .expect("Failed to create HttpModelConfig");
@@ -105,7 +107,11 @@ impl CompletionServer {
 
 #[async_trait]
 impl CompletionStream for CompletionServer {
-    async fn generate(&self, prompt: &str, options: CompletionOptions) -> BoxStream<String> {
+    async fn generate(
+        &self,
+        prompt: &str,
+        options: CompletionOptions,
+    ) -> BoxStream<'life0, String> {
         self.completion.generate(prompt, options).await
     }
 }
@@ -142,6 +148,7 @@ impl ChatCompletionServer {
     async fn new_with_supervisor(server: Arc<LlamaCppSupervisor>) -> Self {
         let config = HttpModelConfigBuilder::default()
             .api_endpoint(Some(api_endpoint(server.port())))
+            .rate_limit(build_rate_limit_config())
             .kind("openai/chat".to_string())
             .model_name(Some("local".into()))
             .build()
@@ -158,15 +165,15 @@ impl ChatCompletionServer {
 impl ChatCompletionStream for ChatCompletionServer {
     async fn chat(
         &self,
-        request: async_openai::types::CreateChatCompletionRequest,
-    ) -> Result<async_openai::types::CreateChatCompletionResponse, OpenAIError> {
+        request: async_openai_alt::types::CreateChatCompletionRequest,
+    ) -> Result<async_openai_alt::types::CreateChatCompletionResponse, OpenAIError> {
         self.chat_completion.chat(request).await
     }
 
     async fn chat_stream(
         &self,
-        request: async_openai::types::CreateChatCompletionRequest,
-    ) -> Result<async_openai::types::ChatCompletionResponseStream, OpenAIError> {
+        request: async_openai_alt::types::CreateChatCompletionRequest,
+    ) -> Result<async_openai_alt::types::ChatCompletionResponseStream, OpenAIError> {
         self.chat_completion.chat_stream(request).await
     }
 }
@@ -257,12 +264,16 @@ pub async fn create_completion_and_chat(
     (Arc::new(completion), prompt_info, Arc::new(chat))
 }
 
-pub async fn create_embedding(config: &ModelConfig) -> Arc<dyn Embedding> {
+pub async fn create_embedding(config: &ModelConfig) -> Option<Arc<dyn Embedding>> {
+    if !tabby_common::config::is_embedding_service_enabled() {
+        return None;
+    }
+
     match config {
-        ModelConfig::Http(http) => http_api_bindings::create_embedding(http).await,
+        ModelConfig::Http(http) => Some(http_api_bindings::create_embedding(http).await),
         ModelConfig::Local(llama) => {
             let model_path = resolve_model_path(&llama.model_id).await;
-            Arc::new(
+            Some(Arc::new(
                 EmbeddingServer::new(
                     llama.num_gpu_layers,
                     &model_path,
@@ -271,7 +282,7 @@ pub async fn create_embedding(config: &ModelConfig) -> Arc<dyn Embedding> {
                     llama.context_size,
                 )
                 .await,
-            )
+            ))
         }
     }
 }
@@ -279,13 +290,39 @@ pub async fn create_embedding(config: &ModelConfig) -> Arc<dyn Embedding> {
 async fn resolve_model_path(model_id: &str) -> String {
     let path = PathBuf::from(model_id);
     let path = if path.exists() {
-        path.join(GGML_MODEL_RELATIVE_PATH.as_str())
+        let ggml_path = path.join("ggml");
+        get_model_entry_path(&ggml_path).unwrap_or_else(|| {
+            // Fallback to the original logic if get_model_entry_path fails
+            ggml_path.join(format!(
+                "{}00001.gguf",
+                GGML_MODEL_PARTITIONED_PREFIX.to_owned()
+            ))
+        })
     } else {
         let (registry, name) = parse_model_id(model_id);
         let registry = ModelRegistry::new(registry).await;
-        registry.get_model_path(name)
+        registry
+            .get_model_entry_path(name)
+            .expect("Model not found")
     };
     path.display().to_string()
+}
+
+// get_model_path returns the entrypoint of the model,
+// will look for the file with the prefix "00001-of-"
+pub fn get_model_entry_path(path: &PathBuf) -> Option<PathBuf> {
+    for entry in fs::read_dir(path).ok()? {
+        let entry = entry.expect("Error reading directory entry");
+        let file_name = entry.file_name();
+        let file_name_str = file_name.to_string_lossy();
+
+        // Check if the file name starts with the specified prefix
+        if file_name_str.starts_with(GGML_MODEL_PARTITIONED_PREFIX.as_str()) {
+            return Some(entry.path()); // Return the full path as PathBuf
+        }
+    }
+
+    None
 }
 
 #[derive(Deserialize)]
@@ -314,4 +351,11 @@ async fn resolve_prompt_info(model_id: &str) -> PromptInfo {
             chat_template: model_info.chat_template.to_owned(),
         }
     }
+}
+
+fn build_rate_limit_config() -> RateLimit {
+    RateLimitBuilder::default()
+        .request_per_minute(6000)
+        .build()
+        .expect("Failed to create RateLimit")
 }

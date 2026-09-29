@@ -2,6 +2,8 @@ import { useQuery } from 'urql'
 
 import { graphql } from '@/lib/gql/generates'
 
+import { ENABLE_CHAT } from '../constants'
+
 export const getServerInfo = graphql(/* GraphQL */ `
   query GetServerInfo {
     serverInfo {
@@ -10,6 +12,7 @@ export const getServerInfo = graphql(/* GraphQL */ `
       isChatEnabled
       allowSelfSignup
       isDemoMode
+      disablePasswordLogin
     }
   }
 `)
@@ -19,8 +22,13 @@ const useServerInfo = () => {
   return data?.serverInfo
 }
 
+const useIsFetchingServerInfo = () => {
+  const [{ fetching }] = useQuery({ query: getServerInfo })
+  return fetching
+}
+
 const useIsChatEnabled = () => {
-  return useServerInfo()?.isChatEnabled
+  return useServerInfo()?.isChatEnabled && ENABLE_CHAT
 }
 
 const useIsAdminInitialized = () => {
@@ -39,10 +47,17 @@ const useIsDemoMode = () => {
   return useServerInfo()?.isDemoMode
 }
 
+const useIsDisablePasswordLogin = () => {
+  return useServerInfo()?.disablePasswordLogin
+}
+
 export {
+  useServerInfo,
   useIsChatEnabled,
   useIsAdminInitialized,
   useIsEmailConfigured,
   useAllowSelfSignup,
-  useIsDemoMode
+  useIsDemoMode,
+  useIsFetchingServerInfo,
+  useIsDisablePasswordLogin
 }

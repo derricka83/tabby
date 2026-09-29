@@ -1,4 +1,4 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, process};
 
 use anyhow::{anyhow, Context, Result};
 use derive_builder::Builder;
@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
     api::code::CodeSearchParams,
-    languages,
+    config, languages,
     path::repositories_dir,
     terminal::{HeaderFormat, InfoMessage},
 };
@@ -27,6 +27,9 @@ pub struct Config {
 
     #[serde(default)]
     pub completion: CompletionConfig,
+
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 
     #[serde(default)]
     pub answer: AnswerConfig,
@@ -65,6 +68,23 @@ impl Config {
             .print();
         }
 
+        if let Err(e) = cfg.validate_config() {
+            InfoMessage::new(
+                "Parsing config failed",
+                HeaderFormat::BoldRed,
+                &[
+                    &format!(
+                        "Warning: Could not parse the Tabby configuration at {}",
+                        crate::path::config_file().as_path().to_string_lossy()
+                    ),
+                    &format!("Reason: {e}"),
+                    "Falling back to default config, please resolve the errors and restart Tabby",
+                ],
+            )
+            .print();
+            process::exit(1);
+        }
+
         Ok(cfg)
     }
 
@@ -82,6 +102,30 @@ impl Config {
                 return Err(anyhow!("Duplicate directory in `repositories`: {}", dir));
             }
         }
+        Ok(())
+    }
+
+    fn validate_config(&self) -> Result<()> {
+        Self::validate_model_config(&self.model.completion)?;
+        Self::validate_model_config(&self.model.chat)?;
+
+        Ok(())
+    }
+
+    fn validate_model_config(model_config: &Option<ModelConfig>) -> Result<()> {
+        if let Some(config::ModelConfig::Http(completion_http_config)) = &model_config {
+            if let Some(models) = &completion_http_config.supported_models {
+                if let Some(model_name) = &completion_http_config.model_name {
+                    if !models.contains(model_name) {
+                        return Err(anyhow!(
+                            "Suppported model list does not contain model: {}",
+                            model_name
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -109,14 +153,27 @@ pub fn config_id_to_index(id: &str) -> Result<usize, anyhow::Error> {
         .ok_or_else(|| anyhow!("Invalid config ID"))
 }
 
+pub fn is_embedding_service_enabled() -> bool {
+    std::env::var("TABBY_EMBEDDING_ENABLED")
+        .ok()
+        .filter(|x| x == "yes")
+        .is_some()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RepositoryConfig {
     git_url: String,
+    #[serde(default)]
+    pub refs: Vec<String>,
 }
 
 impl RepositoryConfig {
     pub fn git_url(&self) -> &str {
         &self.git_url
+    }
+
+    pub fn git_refs(&self) -> Vec<String> {
+        self.refs.clone()
     }
 
     pub fn canonicalize_url(url: &str) -> String {
@@ -140,8 +197,13 @@ impl RepositoryConfig {
 
     pub fn resolve_dir(git_url: &str) -> PathBuf {
         if Self::resolve_is_local_dir(git_url) {
-            let path = git_url.strip_prefix("file://").unwrap();
-            path.into()
+            url::Url::parse(git_url)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .unwrap_or_else(|| {
+                    let path = git_url.strip_prefix("file://").unwrap_or(git_url);
+                    PathBuf::from(path)
+                })
         } else {
             repositories_dir().join(Self::resolve_dir_name(git_url))
         }
@@ -219,12 +281,17 @@ pub enum ModelConfig {
 }
 
 impl ModelConfig {
-    pub fn new_local(model_id: &str, parallelism: u8, num_gpu_layers: u16) -> Self {
+    pub fn new_local(
+        model_id: &str,
+        parallelism: u8,
+        num_gpu_layers: u16,
+        enable_fast_attention: Option<bool>,
+    ) -> Self {
         Self::Local(LocalModelConfig {
             model_id: model_id.to_owned(),
             parallelism,
             num_gpu_layers,
-            enable_fast_attention: None,
+            enable_fast_attention,
             context_size: default_context_size(),
             additional_stop_words: None,
         })
@@ -246,6 +313,9 @@ pub struct HttpModelConfig {
 
     #[builder(default)]
     pub api_key: Option<String>,
+
+    #[serde(default)]
+    pub rate_limit: RateLimit,
 
     /// Used by OpenAI style API for model name.
     #[builder(default)]
@@ -288,7 +358,7 @@ pub struct LocalModelConfig {
 }
 
 fn default_parallelism() -> u8 {
-    1
+    4
 }
 
 fn default_num_gpu_layers() -> u16 {
@@ -297,6 +367,20 @@ fn default_num_gpu_layers() -> u16 {
 
 fn default_context_size() -> usize {
     4096
+}
+
+#[derive(Serialize, Deserialize, Builder, Debug, Clone)]
+pub struct RateLimit {
+    // The limited number of requests can be made in one minute.
+    pub request_per_minute: u64,
+}
+
+impl Default for RateLimit {
+    fn default() -> Self {
+        Self {
+            request_per_minute: 1200,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -334,8 +418,34 @@ impl Default for CompletionConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct EmbeddingConfig {
+    #[serde(default = "default_embedding_max_input_length")]
+    pub max_input_length: usize,
+}
+
+// In the majority of instances, the ratio of tokens to words is 100:75,
+// The default_embedding_max_input_length configured to be 5120 characters,
+// since the default argument for ubatch-size in llama.cpp is 4096.
+fn default_embedding_max_input_length() -> usize {
+    5120
+}
+
+#[derive(Clone)]
+pub struct PageConfig {
+    pub code_search_params: CodeSearchParams,
+}
+
+impl Default for PageConfig {
+    fn default() -> Self {
+        Self {
+            code_search_params: default_answer_code_search_params(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AnswerConfig {
-    #[serde(default)]
+    #[serde(default = "default_answer_code_search_params")]
     pub code_search_params: CodeSearchParams,
 
     #[serde(default = "default_presence_penalty")]
@@ -343,6 +453,26 @@ pub struct AnswerConfig {
 
     #[serde(default = "AnswerConfig::default_system_prompt")]
     pub system_prompt: String,
+}
+
+impl Default for AnswerConfig {
+    fn default() -> Self {
+        Self {
+            code_search_params: default_answer_code_search_params(),
+            presence_penalty: default_presence_penalty(),
+            system_prompt: Self::default_system_prompt(),
+        }
+    }
+}
+
+fn default_answer_code_search_params() -> CodeSearchParams {
+    CodeSearchParams {
+        min_embedding_score: 0.5,
+        min_bm25_score: -1.0,
+        min_rrf_score: -1.0,
+        num_to_return: 10,
+        num_to_score: 100,
+    }
 }
 
 impl AnswerConfig {
@@ -355,13 +485,15 @@ impl AnswerConfig {
 pub struct CodeRepository {
     pub git_url: String,
     pub source_id: String,
+    pub git_refs: Vec<String>,
 }
 
 impl CodeRepository {
-    pub fn new(git_url: &str, source_id: &str) -> Self {
+    pub fn new(git_url: &str, source_id: &str, git_refs: Vec<String>) -> Self {
         Self {
             git_url: git_url.to_owned(),
             source_id: source_id.to_owned(),
+            git_refs,
         }
     }
 
@@ -383,6 +515,7 @@ impl CodeRepository {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::{sanitize_name, Config, RepositoryConfig};
 
@@ -393,9 +526,139 @@ mod tests {
     }
 
     #[test]
+    fn it_parses_invalid_model_name_config() {
+        let toml_config = r#"
+            # Completion model
+            [model.completion.http]
+            kind = "llama.cpp/completion"
+            api_endpoint = "http://localhost:8888"
+            prompt_template = "<PRE> {prefix} <SUF>{suffix} <MID>"  # Example prompt template for the CodeLlama model series.
+            supported_models = ["test"]
+            model_name = "wsxiaoys/StarCoder-1B"
+
+            # Chat model
+            [model.chat.http]
+            kind = "openai/chat"
+            api_endpoint = "http://localhost:8888"
+            supported_models = ["Qwen2-1.5B-Instruct"]
+            model_name = "Qwen2-1.5B-Instruct"
+
+            # Embedding model
+            [model.embedding.http]
+            kind = "llama.cpp/embedding"
+            api_endpoint = "http://localhost:8888"
+            model_name = "Qwen2-1.5B-Instruct"
+            "#;
+
+        let config: Config =
+            serdeconv::from_toml_str::<Config>(toml_config).expect("Failed to parse config");
+
+        if let Err(e) = Config::validate_model_config(&config.model.completion) {
+            println!("Final result: {e}");
+        }
+
+        assert!(
+            matches!(Config::validate_model_config(&config.model.completion), Err(ref _e) if true)
+        );
+        assert!(Config::validate_model_config(&config.model.chat).is_ok());
+    }
+    #[test]
+    #[cfg(windows)]
+    fn test_resolve_dir_handles_various_file_urls_windows() {
+        use std::path::PathBuf;
+
+        let test_cases = vec![
+            // Standard Windows-style file URL (forward slashes)
+            (
+                "file:///C:/Users/test/project",
+                PathBuf::from(r"C:\Users\test\project"),
+            ),
+            // Lowercase drive letter
+            (
+                "file:///c:/Users/test/project",
+                PathBuf::from(r"C:\Users\test\project"),
+            ),
+            // Trailing slash
+            (
+                "file:///C:/Users/test/project/",
+                PathBuf::from(r"C:\Users\test\project"),
+            ),
+            // Encoded characters
+            (
+                "file:///C:/Users/test/My%20Project",
+                PathBuf::from(r"C:\Users\test\My Project"),
+            ),
+            // .git repo
+            (
+                "file:///C:/Users/test/project.git",
+                PathBuf::from(r"C:\Users\test\project.git"),
+            ),
+            // Multiple slashes
+            (
+                "file:////C:/Users/test/project",
+                PathBuf::from(r"C:\Users\test\project"),
+            ),
+            // original issue case
+            (
+                "file://C:\\repos\\myproject",
+                PathBuf::from(r"C:\repos\myproject"),
+            ),
+        ];
+
+        for (input, expected_suffix) in test_cases {
+            let result = RepositoryConfig::resolve_dir(input);
+            assert!(
+                result.ends_with(&expected_suffix),
+                "Failed for input:\n  {}\nExpected suffix:\n  {:?}\nGot:\n  {:?}",
+                input,
+                expected_suffix,
+                result
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_resolve_dir_handles_various_file_urls_unix() {
+        use std::path::PathBuf;
+
+        let test_cases = vec![
+            // Standard Unix-style file URL
+            (
+                "file:///home/user/project",
+                PathBuf::from("/home/user/project"),
+            ),
+            // File URL with trailing slash
+            (
+                "file:///home/user/project/",
+                PathBuf::from("/home/user/project"),
+            ),
+            // File URL with encoded characters (e.g., spaces)
+            (
+                "file:///home/user/My%20Project",
+                PathBuf::from("/home/user/My Project"),
+            ),
+            // File URL pointing to a .git directory
+            (
+                "file:///home/user/project.git",
+                PathBuf::from("/home/user/project.git"),
+            ),
+        ];
+
+        for (input, expected_suffix) in test_cases {
+            let result = RepositoryConfig::resolve_dir(input);
+            assert!(
+                result.ends_with(&expected_suffix),
+                "Failed for input:\n  {input}\nExpected suffix:\n  {expected_suffix:?}\nGot:\n  {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn it_parses_local_dir() {
         let repo = RepositoryConfig {
             git_url: "file:///home/user".to_owned(),
+            refs: vec![],
         };
         let _ = repo.dir();
     }
@@ -404,6 +667,7 @@ mod tests {
     fn test_repository_config_name() {
         let repo = RepositoryConfig {
             git_url: "https://github.com/TabbyML/tabby.git".to_owned(),
+            refs: vec![],
         };
         assert!(repo.dir().ends_with("https_github.com_TabbyML_tabby"));
     }

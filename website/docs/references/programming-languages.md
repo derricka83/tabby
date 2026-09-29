@@ -37,7 +37,9 @@ For an actual example of an issue or pull request adding the above support, plea
 * [Dart](https://dart.dev/)
 * [Lua](https://www.lua.org)
 * [Elixir](https://elixir-lang.org)
-* [OCaml](https://ocaml.org/): Since v0.17.0
+* [OCaml](https://ocaml.org/)
+* [GDScript](https://gdscript.com/)
+* [Scala](https://www.scala-lang.org/)
 
 ## Languages Missing Certain Support
 
@@ -47,4 +49,3 @@ For an actual example of an issue or pull request adding the above support, plea
 | Haskell  |                    🚫                    |                       🚫                        |
 |  Julia   |                    🚫                    |                       🚫                        |
 |   Perl   |                    🚫                    |                       🚫                        |
-|  Scala   |                    🚫                    |                       🚫                        |

@@ -1,21 +1,19 @@
 package com.tabbyml.tabby4eclipse.chat;
 
-import java.net.URI;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 
-import org.eclipse.core.resources.IFile;
-import org.eclipse.core.resources.IProject;
-import org.eclipse.core.resources.ResourcesPlugin;
 import org.eclipse.core.runtime.FileLocator;
 import org.eclipse.core.runtime.Path;
 import org.eclipse.core.runtime.Platform;
-import org.eclipse.jface.resource.ColorRegistry;
-import org.eclipse.jface.resource.FontRegistry;
-import org.eclipse.jface.text.IDocument;
+import org.eclipse.jface.action.Action;
+import org.eclipse.jface.action.IToolBarManager;
+import org.eclipse.jface.resource.ImageDescriptor;
 import org.eclipse.jface.text.ITextSelection;
 import org.eclipse.jface.viewers.ISelection;
 import org.eclipse.swt.SWT;
@@ -28,55 +26,35 @@ import org.eclipse.swt.graphics.FontData;
 import org.eclipse.swt.graphics.RGB;
 import org.eclipse.swt.layout.FillLayout;
 import org.eclipse.swt.widgets.Composite;
-import org.eclipse.ui.IEditorPart;
-import org.eclipse.ui.IWorkbenchPage;
-import org.eclipse.ui.IWorkbenchWindow;
-import org.eclipse.ui.PartInitException;
+import org.eclipse.swt.widgets.Display;
+import org.eclipse.ui.ISelectionListener;
+import org.eclipse.ui.IWorkbenchPart;
 import org.eclipse.ui.PlatformUI;
-import org.eclipse.ui.ide.IDE;
-import org.eclipse.ui.ide.ResourceUtil;
 import org.eclipse.ui.part.ViewPart;
-import org.eclipse.ui.texteditor.ITextEditor;
-import org.eclipse.ui.themes.ITheme;
+import org.eclipse.ui.themes.ColorUtil;
 import org.osgi.framework.Bundle;
 
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.tabbyml.tabby4eclipse.Activator;
+import com.tabbyml.tabby4eclipse.DebouncedRunnable;
+import com.tabbyml.tabby4eclipse.Images;
 import com.tabbyml.tabby4eclipse.Logger;
+import com.tabbyml.tabby4eclipse.StringUtils;
 import com.tabbyml.tabby4eclipse.Utils;
-import com.tabbyml.tabby4eclipse.chat.ChatMessage.FileContext;
+import com.tabbyml.tabby4eclipse.chat.ChatViewUtils.RangeStrategy;
 import com.tabbyml.tabby4eclipse.editor.EditorUtils;
-import com.tabbyml.tabby4eclipse.git.GitProvider;
 import com.tabbyml.tabby4eclipse.lsp.LanguageServerService;
 import com.tabbyml.tabby4eclipse.lsp.ServerConfigHolder;
 import com.tabbyml.tabby4eclipse.lsp.StatusInfoHolder;
 import com.tabbyml.tabby4eclipse.lsp.protocol.Config;
-import com.tabbyml.tabby4eclipse.lsp.protocol.GitRepository;
-import com.tabbyml.tabby4eclipse.lsp.protocol.GitRepositoryParams;
 import com.tabbyml.tabby4eclipse.lsp.protocol.ILanguageServer;
 import com.tabbyml.tabby4eclipse.lsp.protocol.IStatusService;
 import com.tabbyml.tabby4eclipse.lsp.protocol.StatusInfo;
 import com.tabbyml.tabby4eclipse.lsp.protocol.StatusRequestParams;
 
+@SuppressWarnings("serial")
 public class ChatView extends ViewPart {
-	private static final String MIN_SERVER_VERSION = "0.16.0";
-	private static final String ID = "com.tabbyml.tabby4eclipse.views.chat";
-
-	public static void openChatView() {
-		IWorkbenchWindow workbenchWindow = PlatformUI.getWorkbench().getActiveWorkbenchWindow();
-		if (workbenchWindow != null) {
-			IWorkbenchPage page = workbenchWindow.getActivePage();
-			if (page != null) {
-				try {
-					page.showView(ID);
-				} catch (PartInitException e) {
-					e.printStackTrace();
-				}
-			}
-		}
-	}
-
 	private Logger logger = new Logger("ChatView");
 	private Gson gson = new Gson();
 
@@ -87,24 +65,74 @@ public class ChatView extends ViewPart {
 	private List<BrowserFunction> browserFunctions = new ArrayList<>();
 
 	private boolean isHtmlLoaded = false;
+	private boolean isChatPanelLoaded = false;
+	private String chatPanelApiVersion = null;
 	private Config.ServerConfig currentConfig;
 
+	private List<String> pendingScripts = new ArrayList<>();
+	private Map<String, CompletableFuture<Object>> pendingChatPanelRequest = new HashMap<>();
+
+	private List<Action> toolbarActions = new ArrayList<>();
+
 	private boolean isDark;
+	private RGB browserBgColor;
 	private RGB bgColor;
-	private RGB bgActiveColor;
 	private RGB fgColor;
 	private RGB borderColor;
+	private RGB inputColor;
+	private RGB inputBorderColor;
 	private RGB primaryColor;
+	private RGB primaryFgColor;
+	private RGB popoverColor;
+	private RGB popoverFgColor;
+	private RGB accentColor;
+	private RGB accentFgColor;
+	private RGB ringColor;
 	private String font;
 	private int fontSize = 13;
 
 	@Override
 	public void createPartControl(Composite parent) {
-		setupThemeStyle();
 		parent.setLayout(new FillLayout());
 
-		browser = new Browser(parent, Utils.isWindows() ? SWT.EDGE : SWT.DEFAULT);
-		browser.setBackground(new Color(bgActiveColor));
+		// Tool bar
+		IToolBarManager toolbarManager = getViewSite().getActionBars().getToolBarManager();
+		Action newChat = new Action("New") {
+			@Override
+			public void run() {
+				chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "navigate", new ArrayList<>() {
+					{
+						add(ChatViewType.NEW_CHAT);
+					}
+				});
+			}
+		};
+		newChat.setImageDescriptor(ImageDescriptor.createFromImage(Images.getIcon(Images.ICON_ADD)));
+		newChat.setToolTipText("Start a new chat.");
+		newChat.setEnabled(false);
+		toolbarManager.add(newChat);
+		toolbarActions.add(newChat);
+
+		Action history = new Action("History") {
+			@Override
+			public void run() {
+				chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "navigate", new ArrayList<>() {
+					{
+						add(ChatViewType.HISTORY);
+					}
+				});
+			}
+		};
+		history.setImageDescriptor(ImageDescriptor.createFromImage(Images.getIcon(Images.ICON_HISTORY)));
+		history.setToolTipText("Show chat history.");
+		newChat.setEnabled(false);
+		toolbarManager.add(history);
+		toolbarActions.add(history);
+
+		// Browser
+		browser = new Browser(parent, Utils.isWindows() ? SWT.EDGE : SWT.WEBKIT);
+		setupThemeStyle();
+		browser.setBackground(new Color(browserBgColor));
 		browser.setVisible(false);
 
 		browser.addProgressListener(new ProgressAdapter() {
@@ -113,42 +141,8 @@ public class ChatView extends ViewPart {
 				handleLoaded();
 			}
 		});
-		// Inject callbacks
-		browserFunctions.add(new BrowserFunction(browser, "handleReload") {
-			@Override
-			public Object function(Object[] arguments) {
-				reloadContent(true);
-				return null;
-			}
-		});
 
-		browserFunctions.add(new BrowserFunction(browser, "handleChatPanelLoaded") {
-			@Override
-			public Object function(Object[] arguments) {
-				handleChatPanelLoaded();
-				return null;
-			}
-		});
-
-		browserFunctions.add(new BrowserFunction(browser, "handleChatPanelStyleApplied") {
-			@Override
-			public Object function(Object[] arguments) {
-				handleChatPanelStyleApplied();
-				return null;
-			}
-		});
-
-		browserFunctions.add(new BrowserFunction(browser, "handleChatPanelRequest") {
-			@Override
-			public Object function(Object[] arguments) {
-				if (arguments.length > 0) {
-					Request request = gson.fromJson(arguments[0].toString(), Request.class);
-					handleChatPanelRequest(request);
-				}
-				return null;
-			}
-		});
-
+		injectFunctions();
 		load();
 		serverConfigHolder.addConfigDidChangeListener(() -> {
 			reloadContent(false);
@@ -156,11 +150,38 @@ public class ChatView extends ViewPart {
 		statusInfoHolder.addStatusDidChangeListener(() -> {
 			reloadContent(false);
 		});
+
+		PlatformUI.getWorkbench().getActiveWorkbenchWindow().getSelectionService()
+				.addSelectionListener(new ISelectionListener() {
+					@Override
+					public void selectionChanged(IWorkbenchPart part, ISelection selection) {
+						if (selection instanceof ITextSelection) {
+							syncActiveSelectionRunnable.call();
+						}
+					}
+				});
 	}
+
+	private DebouncedRunnable syncActiveSelectionRunnable = new DebouncedRunnable(() -> {
+		if (!isChatPanelLoaded) {
+			return;
+		}
+		EditorUtils.asyncExec(() -> {
+			try {
+				chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "updateActiveSelection", new ArrayList<>() {
+					{
+						add(ChatViewUtils.getActiveEditorFileContext());
+					}
+				});
+			} catch (Exception e) {
+				// ignore
+			}
+		});
+	}, 100);
 
 	@Override
 	public void setFocus() {
-		browser.setFocus();
+		browser.forceFocus();
 	}
 
 	@Override
@@ -173,6 +194,299 @@ public class ChatView extends ViewPart {
 			browserFunctions.clear();
 		}
 		super.dispose();
+	}
+
+	public void explainSelectedText() {
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "executeCommand", new ArrayList<>() {
+			{
+				add(ChatCommand.EXPLAIN);
+			}
+		});
+	}
+
+	public void fixSelectedText() {
+		// FIXME(@icycodes): collect the diagnostic message provided by IDE or LSP
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "executeCommand", new ArrayList<>() {
+			{
+				add(ChatCommand.FIX);
+			}
+		});
+	}
+
+	public void generateDocsForSelectedText() {
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "executeCommand", new ArrayList<>() {
+			{
+				add(ChatCommand.GENERATE_DOCS);
+			}
+		});
+	}
+
+	public void generateTestsForSelectedText() {
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "executeCommand", new ArrayList<>() {
+			{
+				add(ChatCommand.GENERATE_TESTS);
+			}
+		});
+	}
+
+	public void addSelectedTextAsContext() {
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "addRelevantContext", new ArrayList<>() {
+			{
+				add(ChatViewUtils.getActiveEditorFileContext(RangeStrategy.SELECTION));
+			}
+		});
+	}
+
+	public void addActiveEditorAsContext() {
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "addRelevantContext", new ArrayList<>() {
+			{
+				add(ChatViewUtils.getActiveEditorFileContext(RangeStrategy.FILE));
+			}
+		});
+	}
+
+	private RGB getColor(int coloirId, RGB defaultColor) {
+		Display display = browser.getDisplay();
+		Color swtColor = display.getSystemColor(coloirId);
+		if (swtColor != null) {
+			return swtColor.getRGB();
+		}
+		return defaultColor;
+	}
+
+	private void setupThemeStyle() {
+		bgColor = getColor(SWT.COLOR_WIDGET_BACKGROUND, new RGB(32, 32, 32));
+		isDark = (bgColor.red + bgColor.green + bgColor.blue) / 3 < 128;
+
+		browserBgColor = getColor(SWT.COLOR_LIST_BACKGROUND, ColorUtil.blend(bgColor, new RGB(127, 127, 127), 75));
+		fgColor = getColor(SWT.COLOR_LIST_FOREGROUND, isDark ? new RGB(255, 255, 255) : new RGB(0, 0, 0));
+		borderColor = isDark ? new RGB(64, 64, 64) : new RGB(192, 192, 192);
+		inputColor = browserBgColor;
+		inputBorderColor = borderColor;
+
+		primaryColor = getColor(SWT.COLOR_LINK_FOREGROUND, isDark ? new RGB(55, 148, 255) : new RGB(26, 133, 255));
+		primaryFgColor = new RGB(255, 255, 255);
+		popoverColor = browserBgColor;
+		popoverFgColor = fgColor;
+		accentColor = isDark ? new RGB(4, 57, 94) : ColorUtil.blend(browserBgColor, new RGB(0, 0, 0), 80);
+		accentFgColor = fgColor;
+		ringColor = primaryColor;
+
+		FontData[] fontData = browser.getDisplay().getSystemFont().getFontData();
+		if (fontData.length > 0) {
+			font = fontData[0].getName();
+			fontSize = fontData[0].getHeight();
+		}
+	}
+
+	private String buildCss() {
+		String css = "";
+		if (browserBgColor != null) {
+			css += String.format("--sidebar-background: %s;", StringUtils.toHsl(browserBgColor));
+		}
+		if (bgColor != null) {
+			css += String.format("--background: %s;", StringUtils.toHsl(bgColor));
+		}
+		if (fgColor != null) {
+			css += String.format("--foreground: %s;", StringUtils.toHsl(fgColor));
+		}
+		if (borderColor != null) {
+			css += String.format("--border: %s;", StringUtils.toHsl(borderColor));
+		}
+		if (inputColor != null) {
+			css += String.format("--input: %s;", StringUtils.toHsl(inputColor));
+		}
+		if (inputBorderColor != null) {
+			css += String.format("--input-border: %s;", StringUtils.toHsl(inputBorderColor));
+		}
+		if (ringColor != null) {
+			css += String.format("--ring: %s;", StringUtils.toHsl(ringColor));
+		}
+		if (primaryColor != null) {
+			css += String.format("--primary: %s;", StringUtils.toHsl(primaryColor));
+		}
+		if (primaryFgColor != null) {
+			css += String.format("--primary-foreground: %s;", StringUtils.toHsl(primaryFgColor));
+		}
+		if (popoverColor != null) {
+			css += String.format("--popover: %s;", StringUtils.toHsl(popoverColor));
+		}
+		if (popoverFgColor != null) {
+			css += String.format("--popover-foreground: %s;", StringUtils.toHsl(popoverFgColor));
+		}
+		if (accentColor != null) {
+			css += String.format("--accent: %s;", StringUtils.toHsl(accentColor));
+		}
+		if (accentFgColor != null) {
+			css += String.format("--accent-foreground: %s;", StringUtils.toHsl(accentFgColor));
+		}
+		if (font != null) {
+			css += String.format("font: %s;", font);
+		}
+		css += String.format("font-size: %spt;", fontSize);
+		return css;
+	}
+
+	private List<Object> parseArguments(final Object[] arguments) {
+		if (arguments.length < 1) {
+			return List.of();
+		}
+		return gson.fromJson(arguments[0].toString(), new TypeToken<List<Object>>() {
+		});
+	}
+
+	private Object serializeResult(final Object result) {
+		return gson.toJson(result);
+	}
+
+	private void injectFunctions() {
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelHandleChatPanelClientCreated") {
+			@Override
+			public Object function(Object[] arguments) {
+				List<Object> params = parseArguments(arguments);
+				logger.debug("chatPanelClientCreated: " + params);
+				if (params.size() < 1) {
+					return null;
+				}
+				initChatPanel((String) params.get(0));
+				setToolbarItemsEnabled(true);
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "handleTabbyChatPanelResponse") {
+			@Override
+			public Object function(Object[] arguments) {
+				List<Object> params = parseArguments(arguments);
+				logger.debug("Response from chat panel: " + params);
+				if (params.size() < 3) {
+					return null;
+				}
+				String uuid = (String) params.get(0);
+				String errorMessage = (String) params.get(1);
+				Object result = params.get(2);
+
+				CompletableFuture<Object> future = pendingChatPanelRequest.remove(uuid);
+				if (future == null) {
+					return null;
+				}
+
+				if (errorMessage != null && !errorMessage.isEmpty()) {
+					future.completeExceptionally(new Exception(errorMessage));
+				} else {
+					future.complete(result);
+				}
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "handleReload") {
+			@Override
+			public Object function(Object[] arguments) {
+				logger.debug("handleReload");
+				reloadContent(true);
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelRefresh") {
+			@Override
+			public Object function(Object[] arguments) {
+				logger.debug("tabbyChatPanelRefresh");
+				reloadContent(true);
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelOnApplyInEditor") {
+			@Override
+			public Object function(Object[] arguments) {
+				List<Object> params = parseArguments(arguments);
+				logger.debug("tabbyChatPanelOnApplyInEditor: " + params);
+				if (params.size() < 1) {
+					return null;
+				}
+				String content = (String) params.get(0);
+				ChatViewUtils.applyContentInEditor(content);
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelOnCopy") {
+			@Override
+			public Object function(Object[] arguments) {
+				List<Object> params = parseArguments(arguments);
+				logger.debug("tabbyChatPanelOnCopy: " + params);
+				if (params.size() < 1) {
+					return null;
+				}
+				String content = (String) params.get(0);
+				ChatViewUtils.setClipboardContent(content);
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelOnKeyboardEvent") {
+			@Override
+			public Object function(Object[] arguments) {
+				// FIXME: For macOS and windows, the eclipse keyboard shortcuts are not
+				// available when browser is focused,
+				// we should handle keyboard events here.
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelOpenInEditor") {
+			@Override
+			public Object function(Object[] arguments) {
+				List<Object> params = parseArguments(arguments);
+				logger.debug("tabbyChatPanelOpenInEditor: " + params);
+				if (params.size() < 1) {
+					return null;
+				}
+				FileLocation fileLocation = ChatViewUtils.asFileLocation(params.get(0));
+				boolean success = ChatViewUtils.openInEditor(fileLocation);
+				Object result = serializeResult(success);
+				logger.debug("tabbyChatPanelOpenInEditor result: " + result);
+				return result;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelOpenExternal") {
+			@Override
+			public Object function(Object[] arguments) {
+				List<Object> params = parseArguments(arguments);
+				logger.debug("tabbyChatPanelOpenExternal: " + params);
+				if (params.size() < 1) {
+					return null;
+				}
+				String url = (String) params.get(0);
+				ChatViewUtils.openExternal(url);
+				return null;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelReadWorkspaceGitRepositories") {
+			@Override
+			public Object function(Object[] arguments) {
+				logger.debug("tabbyChatPanelReadWorkspaceGitRepositories");
+				List<GitRepository> repositories = ChatViewUtils.readGitRepositoriesInWorkspace();
+				Object result = serializeResult(repositories);
+				logger.debug("tabbyChatPanelReadWorkspaceGitRepositories result: " + result);
+				return result;
+			}
+		});
+
+		browserFunctions.add(new BrowserFunction(browser, "tabbyChatPanelGetActiveEditorSelection") {
+			@Override
+			public Object function(Object[] arguments) {
+				logger.debug("tabbyChatPanelGetActiveEditorSelection");
+				EditorFileContext context = ChatViewUtils.getActiveEditorFileContext();
+				Object result = serializeResult(context);
+				logger.debug("tabbyChatPanelGetActiveEditorSelection result: " + result);
+				return result;
+			}
+		});
 	}
 
 	private void load() {
@@ -196,7 +510,9 @@ public class ChatView extends ViewPart {
 
 	private void handleLoaded() {
 		isHtmlLoaded = true;
+		isChatPanelLoaded = false;
 		applyStyle();
+		createChatPanelClient();
 		reloadContent(false);
 	}
 
@@ -205,14 +521,18 @@ public class ChatView extends ViewPart {
 			return;
 		}
 		if (force) {
-			LanguageServerService.getInstance().getServer().execute((server) -> {
-				IStatusService statusService = ((ILanguageServer) server).getStatusService();
-				StatusRequestParams params = new StatusRequestParams();
-				params.setRecheckConnection(true);
-				return statusService.getStatus(params);
-			}).thenAccept((statusInfo) -> {
-				String status = statusInfo.getStatus();
-				reloadContentForStatus(status, true);
+			reloadContentForStatus(StatusInfo.Status.CONNECTING, false);
+			// delay to make the loading indicator visible for a bit
+			browser.getDisplay().timerExec(500, () -> {
+				LanguageServerService.getInstance().getServer().execute((server) -> {
+					IStatusService statusService = ((ILanguageServer) server).getStatusService();
+					StatusRequestParams params = new StatusRequestParams();
+					params.setRecheckConnection(true);
+					return statusService.getStatus(params);
+				}).thenAccept((statusInfo) -> {
+					String status = statusInfo.getStatus();
+					reloadContentForStatus(status, true);
+				});
 			});
 		} else {
 			String status = statusInfoHolder.getStatusInfo().getStatus();
@@ -222,25 +542,30 @@ public class ChatView extends ViewPart {
 
 	private void reloadContentForStatus(String status, boolean force) {
 		if (status.equals(StatusInfo.Status.DISCONNECTED)) {
-			showMessage("Cannot connect to Tabby server, please check your settings.");
-			showChatPanel(false);
+			currentConfig = null;
+			updateContentToMessage("Cannot connect to Tabby server, please check your settings.");
+		} else if (status.equals(StatusInfo.Status.CONNECTING)) {
+			currentConfig = null;
+			updateContentToMessage("Connecting to Tabby server...");
 		} else if (status.equals(StatusInfo.Status.UNAUTHORIZED)) {
-			showMessage("Authorization required, please set your token in settings.");
-			showChatPanel(false);
+			currentConfig = null;
+			updateContentToMessage("Authorization required, please set your token in settings.");
 		} else {
 			Map<String, Object> serverHealth = statusInfoHolder.getStatusInfo().getServerHealth();
-			String error = checkServerHealth(serverHealth);
+			String error = ChatViewUtils.checkServerHealth(serverHealth);
 			if (error != null) {
-				showMessage(error);
-				showChatPanel(false);
+				currentConfig = null;
+				updateContentToMessage(error);
 			} else {
 				// Load main
 				Config.ServerConfig config = serverConfigHolder.getConfig().getServer();
-				if (config != null
-						&& (force || currentConfig == null || currentConfig.getEndpoint() != config.getEndpoint()
-								|| currentConfig.getToken() != config.getToken())) {
-					showMessage("Connecting to Tabby server...");
-					showChatPanel(false);
+				if (config == null) {
+					currentConfig = null;
+					updateContentToMessage("Initializing...");
+				} else if (force || currentConfig == null || currentConfig.getEndpoint() != config.getEndpoint()
+						|| currentConfig.getToken() != config.getToken()) {
+					updateContentToMessage("Loading chat panel...");
+					isChatPanelLoaded = false;
 					currentConfig = config;
 					loadChatPanel();
 				}
@@ -248,105 +573,46 @@ public class ChatView extends ViewPart {
 		}
 	}
 
-	private void showMessage(String message) {
-		browser.getDisplay().asyncExec(() -> {
-			if (message != null) {
-				browser.execute(String.format("showMessage('%s')", message));
-			} else {
-				browser.execute("showMessage(undefined)");
-			}
+	private void updateContentToMessage(String message) {
+		showMessage(message);
+		showChatPanel(false);
+		setToolbarItemsEnabled(false);
+	}
+
+	private void updateContentToChatPanel() {
+		showMessage(null);
+		showChatPanel(true);
+	}
+
+	private void setToolbarItemsEnabled(Boolean enabled) {
+		toolbarActions.forEach((action) -> {
+			action.setEnabled(enabled);
 		});
 	}
 
-	private void showChatPanel(boolean visiable) {
+	// execute js functions
+
+	private void executeScript(String script) {
 		browser.getDisplay().asyncExec(() -> {
-			browser.execute(String.format("showChatPanel(%s)", visiable ? "true" : "false"));
+			browser.execute(script);
 		});
+	}
+
+	private void showMessage(String message) {
+		if (message != null) {
+			executeScript(String.format("showMessage('%s')", message));
+		} else {
+			executeScript("showMessage(undefined)");
+		}
+	}
+
+	private void showChatPanel(boolean visible) {
+		executeScript(String.format("showChatPanel(%s)", visible ? "true" : "false"));
 	}
 
 	private void loadChatPanel() {
-		// FIXME(@icycodes): set query string to vscode for now to turn on callbacks
-		String chatUrl = String.format("%s/chat?client=vscode", currentConfig.getEndpoint());
-		browser.getDisplay().asyncExec(() -> {
-			browser.execute(String.format("loadChatPanel('%s')", chatUrl));
-		});
-	}
-
-	private String checkServerHealth(Map<String, Object> serverHealth) {
-		if (serverHealth == null) {
-			return "Connecting to Tabby server...";
-		}
-
-		if (serverHealth.get("webserver") == null || serverHealth.get("chat_model") == null) {
-			return "You need to launch the server with the chat model enabled; for example, use `--chat-model Qwen2-1.5B-Instruct`.";
-		}
-
-		if (serverHealth.containsKey("version")) {
-			String version = null;
-			Object versionObj = serverHealth.get("version");
-			if (versionObj instanceof String versionStr) {
-				version = versionStr;
-			} else if (versionObj instanceof Map versionMap) {
-				if (versionMap.containsKey("git_describe")
-						&& versionMap.get("git_describe") instanceof String versionStr) {
-					version = versionStr;
-				}
-			}
-			if (version != null && !isVersionCompatible(version)) {
-				return String.format(
-						"Tabby Chat requires Tabby server version %s or later. Your server is running version %s.",
-						MIN_SERVER_VERSION, version);
-			}
-		}
-		return null;
-	}
-
-	private boolean isVersionCompatible(String version) {
-		String versionStr = version;
-		if (versionStr != null && versionStr.length() > 0 && versionStr.charAt(0) == 'v') {
-			versionStr = versionStr.substring(1);
-		}
-		String[] versionParts = versionStr.trim().split("\\.");
-		String[] minVersionParts = MIN_SERVER_VERSION.split("\\.");
-
-		for (int i = 0; i < Math.max(versionParts.length, minVersionParts.length); i++) {
-			int versionPart = i < versionParts.length ? parseInt(versionParts[i]) : 0;
-			int minVersionPart = i < minVersionParts.length ? parseInt(minVersionParts[i]) : 0;
-
-			if (versionPart < minVersionPart) {
-				return false;
-			} else if (versionPart > minVersionPart) {
-				return true;
-			}
-		}
-
-		return true;
-	}
-
-	private int parseInt(String str) {
-		try {
-			return Integer.parseInt(str);
-		} catch (NumberFormatException e) {
-			return 0;
-		}
-	}
-
-	private void setupThemeStyle() {
-		ITheme currentTheme = PlatformUI.getWorkbench().getThemeManager().getCurrentTheme();
-		ColorRegistry colorRegistry = currentTheme.getColorRegistry();
-		bgColor = colorRegistry.getRGB("org.eclipse.ui.workbench.ACTIVE_TAB_BG_START");
-		bgActiveColor = colorRegistry.getRGB("org.eclipse.ui.workbench.ACTIVE_TAB_BG_END");
-		fgColor = colorRegistry.getRGB("org.eclipse.ui.workbench.ACTIVE_TAB_TEXT_COLOR");
-		borderColor = colorRegistry.getRGB("org.eclipse.ui.workbench.ACTIVE_TAB_INNER_KEYLINE_COLOR");
-		primaryColor = colorRegistry.getRGB("org.eclipse.ui.workbench.LINK_COLOR");
-		isDark = (bgColor.red + bgColor.green + bgColor.blue) / 3 < 128;
-
-		FontRegistry fontRegistry = currentTheme.getFontRegistry();
-		FontData[] fontData = fontRegistry.getFontData("org.eclipse.jface.textfont");
-		if (fontData.length > 0) {
-			font = fontData[0].getName();
-			fontSize = fontData[0].getHeight();
-		}
+		String chatUrl = String.format("%s/chat?client=eclipse", currentConfig.getEndpoint());
+		executeScript(String.format("loadChatPanel('%s')", chatUrl));
 	}
 
 	private void applyStyle() {
@@ -358,67 +624,21 @@ public class ChatView extends ViewPart {
 				put("css", css);
 			}
 		});
-		browser.getDisplay().asyncExec(() -> {
-			browser.execute(String.format("applyStyle('%s')", json));
-			browser.setVisible(true);
+		executeScript(String.format("applyStyle('%s')", json));
+		browser.setVisible(true);
+	}
+
+	private void initChatPanel(String version) {
+		isChatPanelLoaded = true;
+		chatPanelApiVersion = version;
+		browser.getDisplay().timerExec(100, () -> {
+			updateContentToChatPanel();
+			pendingScripts.forEach((script) -> {
+				executeScript(script);
+			});
+			pendingScripts.clear();
 		});
-	}
-
-	private String buildCss() {
-		String css = "";
-		if (bgActiveColor != null) {
-			css += String.format("background-color: hsl(%s);", toHsl(bgActiveColor));
-		}
-		if (bgColor != null) {
-			css += String.format("--background: %s;", toHsl(bgColor));
-		}
-		if (fgColor != null) {
-			css += String.format("--foreground: %s;", toHsl(fgColor));
-		}
-		if (borderColor != null) {
-			css += String.format("--border: %s;", toHsl(borderColor));
-		}
-		if (primaryColor != null) {
-			css += String.format("--primary: %s;", toHsl(primaryColor));
-		}
-		if (font != null) {
-			css += String.format("font: %s;", font);
-		}
-		css += String.format("font-size: %spt;", fontSize);
-		return css;
-	}
-
-	private static String toHsl(RGB rgb) {
-		double r = rgb.red / 255.0;
-		double g = rgb.green / 255.0;
-		double b = rgb.blue / 255.0;
-		double max = Math.max(r, Math.max(g, b));
-		double min = Math.min(r, Math.min(g, b));
-		double l = (max + min) / 2.0;
-		double h, s;
-		if (max == min) {
-			h = 0;
-			s = 0;
-		} else {
-			double delta = max - min;
-			s = l > 0.5 ? delta / (2.0 - max - min) : delta / (max + min);
-			if (max == r) {
-				h = (g - b) / delta + (g < b ? 6 : 0);
-			} else if (max == g) {
-				h = (b - r) / delta + 2;
-			} else {
-				h = (r - g) / delta + 4;
-			}
-			h /= 6;
-		}
-		h *= 360;
-		s *= 100;
-		l *= 100;
-		return String.format("%.0f, %.0f%%, %.0f%%", h, s, l);
-	}
-
-	private void handleChatPanelLoaded() {
-		sendRequestToChatPanel(new Request("init", new ArrayList<>() {
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "init", new ArrayList<>() {
 			{
 				add(new HashMap<>() {
 					{
@@ -430,161 +650,129 @@ public class ChatView extends ViewPart {
 					}
 				});
 			}
-		}));
-	}
-
-	private void handleChatPanelStyleApplied() {
-		showMessage(null);
-		showChatPanel(true);
-	}
-
-	private void sendRequestToChatPanel(Request request) {
-		String json = gson.toJson(request);
-		browser.getDisplay().asyncExec(() -> {
-			browser.execute(String.format("sendRequestToChatPanel('%s')", escapeCharacters(json)));
+		});
+		chatPanelClientInvoke(ChatViewUtils.API_0_8_0, "updateTheme", new ArrayList<>() {
+			{
+				add(buildCss());
+				add(isDark ? "dark" : "light");
+			}
 		});
 	}
 
-	public static String escapeCharacters(String jsonString) {
-		return jsonString.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
-				.replace("\t", "\\t");
+	private String wrapJsFunction(String name) {
+		return String.format(
+			String.join("\n",
+				"function(...args) {",
+				"  return new Promise((resolve, reject) => {",
+				"    const paramsJson = JSON.stringify(args)",
+				"    const result = %s(paramsJson)",
+				"    resolve(JSON.parse(result))",
+				"  });",
+				"}"
+			),
+			name
+		);
 	}
 
-	private void handleChatPanelRequest(Request request) {
-		switch (request.getMethod()) {
-		case "navigate": {
-			List<Object> params = request.getParams();
-			if (params.size() < 1) {
-				return;
-			}
-			FileContext context = gson.fromJson(gson.toJson(params.get(0)), FileContext.class);
-			navigateToFileContext(context);
-			break;
-		}
-		case "onSubmitMessage": {
-			List<Object> params = request.getParams();
-			if (params.size() < 1) {
-				return;
-			}
-			String message = (String) params.get(0);
-			List<FileContext> releventContexts = params.size() > 1
-					? releventContexts = gson.fromJson(gson.toJson(params.get(1)), new TypeToken<List<FileContext>>() {
-					}.getType())
-					: null;
-			sendRequestToChatPanel(new Request("sendMessage", new ArrayList<>() {
-				{
-					ChatMessage chatMessage = new ChatMessage();
-					chatMessage.setMessage(message);
-					if (releventContexts != null && !releventContexts.isEmpty()) {
-						chatMessage.setRelevantContext(releventContexts);
-					} else {
-						chatMessage.setActiveContext(getActiveContext());
-					}
-					add(chatMessage);
-				}
-			}));
-			break;
-		}
-		case "onApplyInEditor": {
-			List<Object> params = request.getParams();
-			if (params.size() < 1) {
-				return;
-			}
-			String content = (String) params.get(0);
-			applyContentInEditor(content);
-			break;
-		}
-		}
+	private void createChatPanelClient() {
+		String script = String.format(
+			String.join("\n",
+				"TabbyChatPanel.createClient(getChatPanel(), {",
+				"  refresh: %s,",
+				"  onApplyInEditor: %s,",
+				"  onCopy: %s,",
+				"  onKeyboardEvent: %s,",
+				"  openInEditor: %s,",
+				"  openExternal: %s,",
+				"  readWorkspaceGitRepositories: %s,",
+				"  getActiveEditorSelection: %s,",
+				"}).then((client) => {",
+				"  window.tabbyChatPanelClient = client;",
+				"  const getVersion = client && client['0.9.0'] && client['0.9.0']['getVersion'];",
+				"  if (getVersion && typeof getVersion === 'function') {",
+				"    return getVersion();",
+				"  } else {",
+				"    return undefined;",
+				"  }",
+				"}).then((version) => {",
+				"  console.log('Tabby Chat Panel API version: ' + version);",
+				"  const callback = %s;",
+				"  callback(version);",
+				"});"
+			),
+			wrapJsFunction("tabbyChatPanelRefresh"),
+			wrapJsFunction("tabbyChatPanelOnApplyInEditor"),
+			wrapJsFunction("tabbyChatPanelOnCopy"),
+			wrapJsFunction("tabbyChatPanelOnKeyboardEvent"),
+			wrapJsFunction("tabbyChatPanelOpenInEditor"),
+			wrapJsFunction("tabbyChatPanelOpenExternal"),
+			wrapJsFunction("tabbyChatPanelReadWorkspaceGitRepositories"),
+			wrapJsFunction("tabbyChatPanelGetActiveEditorSelection"),
+			wrapJsFunction("tabbyChatPanelHandleChatPanelClientCreated")
+		);
+		executeScript(script);
 	}
 
-	private FileContext getActiveContext() {
-		ITextEditor activeTextEditor = EditorUtils.getActiveTextEditor();
-		if (activeTextEditor == null) {
-			return null;
-		}
-		FileContext context = new FileContext();
-
-		IFile file = ResourceUtil.getFile(activeTextEditor.getEditorInput());
-		URI fileUri = file.getLocationURI();
-		if (file != null) {
-			GitRepository gitInfo = GitProvider.getInstance()
-					.getRepository(new GitRepositoryParams(fileUri.toString()));
-			IProject project = file.getProject();
-			if (gitInfo != null) {
-				try {
-					context.setGitUrl(gitInfo.getRemoteUrl());
-					String relativePath = new URI(gitInfo.getRoot()).relativize(fileUri).getPath();
-					context.setFilePath(relativePath);
-				} catch (Exception e) {
-					logger.error("Failed to get git info.", e);
-				}
-			} else if (project != null) {
-				URI projectRoot = project.getLocationURI();
-				String relativePath = projectRoot.relativize(fileUri).getPath();
-				context.setFilePath(relativePath);
-			} else {
-				context.setFilePath(fileUri.toString());
-			}
-		}
-
-		ISelection selection = activeTextEditor.getSelectionProvider().getSelection();
-		if (selection instanceof ITextSelection textSelection) {
-			if (textSelection.isEmpty() || textSelection.getText().isBlank()) {
-				IDocument document = activeTextEditor.getDocumentProvider()
-						.getDocument(activeTextEditor.getEditorInput());
-				context.setRange(new FileContext.LineRange(1, document.getNumberOfLines()));
-				context.setContent(document.get());
-			} else {
-				context.setRange(
-						new FileContext.LineRange(textSelection.getStartLine() + 1, textSelection.getEndLine() + 1));
-				context.setContent(textSelection.getText());
-			}
-		}
-		return context;
-	}
-
-	private void navigateToFileContext(FileContext context) {
-		logger.info("Navigate to file: " + context.getFilePath() + ", line: " + context.getRange().getStart());
-		// FIXME(@icycode): the base path could be a git repository root, but it cannot
-		// be determined here
-		IFile file = null;
-		ITextEditor activeTextEditor = EditorUtils.getActiveTextEditor();
-		if (activeTextEditor != null) {
-			// try find file in the project of the active editor
-			IFile activeFile = ResourceUtil.getFile(activeTextEditor.getEditorInput());
-			if (activeFile != null) {
-				file = activeFile.getProject().getFile(new Path(context.getFilePath()));
-			}
+	private CompletableFuture<Object> chatPanelClientInvoke(String version, String method, List<Object> params) {
+		CompletableFuture<Object> future = new CompletableFuture<>();
+		String uuid = UUID.randomUUID().toString();
+		pendingChatPanelRequest.put(uuid, future);
+		String paramsJson = StringUtils.escapeCharacters(gson.toJson(params));
+		String responseCallbackFunction = "handleTabbyChatPanelResponse(results)";
+		String script = String.format(
+			String.join("\n",
+				"(function() {",
+				"  const client = window.tabbyChatPanelClient;",
+				"  if (client && typeof client === 'object') {",
+				"    const func = client['%s'] && client['%s']['%s']",
+				"    if (func && typeof func === 'function') {",
+				"      const params = JSON.parse('%s')",
+				"      const resultPromise = func(...params)",
+				"      if (resultPromise && typeof resultPromise.then === 'function') {",
+				"        resultPromise.then(result => {",
+				"          const results = JSON.stringify(['%s', null, result])",
+				"          %s",
+				"        }).catch(error => {",
+				"          const results = JSON.stringify(['%s', error.message, null])",
+				"          %s",
+				"        })",
+				"      } else {",
+				"        const results = JSON.stringify(['%s', null, resultPromise])",
+				"        %s",
+				"      }",
+				"    } else {",
+				"      const results = JSON.stringify(['%s', 'Method not found: %s %s', null])",
+				"      %s",
+				"    }",
+				"  } else {",
+				"    const results = JSON.stringify(['%s', 'Tabby chat panel client is not connected.', null])",
+				"    %s",
+				"  }",
+				"})();"
+			),
+			version,
+			version,
+			method,
+			paramsJson,
+			uuid,
+			responseCallbackFunction,
+			uuid,
+			responseCallbackFunction,
+			uuid,
+			responseCallbackFunction,
+			uuid,
+			version,
+			method,
+			responseCallbackFunction,
+			uuid,
+			responseCallbackFunction
+		);
+		logger.debug("Request to chat panel: " + uuid + ", " + version + "," + method + ", " + paramsJson);
+		if (isChatPanelLoaded) {
+			executeScript(script);
 		} else {
-			// try find file in the workspace
-			file = ResourcesPlugin.getWorkspace().getRoot().getFileForLocation(new Path(context.getFilePath()));
+			pendingScripts.add(script);
 		}
-		try {
-			if (file != null && file.exists()) {
-				IEditorPart editorPart = IDE.openEditor(EditorUtils.getActiveWorkbenchPage(), file);
-				if (editorPart instanceof ITextEditor textEditor) {
-					IDocument document = textEditor.getDocumentProvider().getDocument(textEditor.getEditorInput());
-					int offset = document.getLineOffset(context.getRange().getStart() - 1);
-					textEditor.selectAndReveal(offset, 0);
-				}
-			}
-		} catch (Exception e) {
-			logger.error("Failed to navigate to file: " + context.getFilePath(), e);
-		}
-	}
-
-	private void applyContentInEditor(String content) {
-		logger.info("Apply content to the active text editor.");
-		ITextEditor activeTextEditor = EditorUtils.getActiveTextEditor();
-		if (activeTextEditor != null) {
-			try {
-				IDocument document = activeTextEditor.getDocumentProvider()
-						.getDocument(activeTextEditor.getEditorInput());
-				ITextSelection selection = (ITextSelection) activeTextEditor.getSelectionProvider().getSelection();
-				document.replace(selection.getOffset(), selection.getLength(), content);
-			} catch (Exception e) {
-				logger.error("Failed to apply content to the active text editor.", e);
-			}
-		}
+		return future;
 	}
 }

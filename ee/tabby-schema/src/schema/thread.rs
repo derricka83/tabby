@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use juniper::ID;
 
-use crate::{policy::AccessPolicy, schema::Result};
+use crate::{auth::UserSecured, schema::Result};
 
 mod types;
 pub use types::*;
@@ -20,6 +20,9 @@ pub trait ThreadService: Send + Sync {
     /// Get a thread by ID
     async fn get(&self, id: &ID) -> Result<Option<Thread>>;
 
+    /// Delete a thread.
+    async fn delete(&self, id: &ID) -> Result<()>;
+
     /// Converting a ephemeral thread to a persisted thread
     async fn set_persisted(&self, id: &ID) -> Result<()>;
 
@@ -34,10 +37,20 @@ pub trait ThreadService: Send + Sync {
         last: Option<usize>,
     ) -> Result<Vec<Thread>>;
 
+    /// List threads owned by a user
+    async fn list_owned(
+        &self,
+        user_id: &ID,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<usize>,
+        last: Option<usize>,
+    ) -> Result<Vec<Thread>>;
+
     /// Create a new thread run
     async fn create_run(
         &self,
-        policy: &AccessPolicy,
+        user: &UserSecured,
         id: &ID,
         options: &ThreadRunOptionsInput,
         attachment_input: Option<&MessageAttachmentInput>,
@@ -47,6 +60,9 @@ pub trait ThreadService: Send + Sync {
 
     /// Append message to an existing thread
     async fn append_user_message(&self, id: &ID, message: &CreateMessageInput) -> Result<()>;
+
+    /// Update a message
+    async fn update_thread_message(&self, message: &UpdateMessageInput) -> Result<()>;
 
     // /// Delete a thread by ID
     // async fn delete(&self, id: ID) -> Result<()>;

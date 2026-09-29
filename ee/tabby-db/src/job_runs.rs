@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Months, Utc};
 use sqlx::{query, FromRow};
 use tabby_db_macros::query_paged_as;
 
@@ -87,6 +87,15 @@ impl DbConn {
         Ok(())
     }
 
+    pub async fn get_job_run(&self, id: i64) -> Option<JobRunDAO> {
+        sqlx::query_as(r#"SELECT * FROM job_runs WHERE id = ?"#)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+    }
+
     pub async fn get_latest_job_run(&self, command: String) -> Option<JobRunDAO> {
         sqlx::query_as(
             r#"SELECT * FROM job_runs WHERE command = ? ORDER BY created_at DESC LIMIT 1"#,
@@ -105,6 +114,23 @@ impl DbConn {
             .await?.rows_affected();
 
         Ok(num_deleted as usize)
+    }
+
+    pub async fn delete_job_run_before_three_months(&self, now: DateTime<Utc>) -> Result<usize> {
+        if let Some(three_months_ago) = now.checked_sub_months(Months::new(3)) {
+            let three_months_ago = three_months_ago.as_sqlite_datetime();
+            let num_deleted = query!(
+                "delete FROM job_runs WHERE updated_at < ? AND exit_code IS NOT NULL",
+                three_months_ago,
+            )
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+
+            Ok(num_deleted as usize)
+        } else {
+            Ok(0)
+        }
     }
 
     pub async fn list_job_runs_with_filter(

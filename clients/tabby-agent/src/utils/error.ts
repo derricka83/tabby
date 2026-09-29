@@ -35,10 +35,18 @@ export function isUnauthorizedError(error: any) {
   return error instanceof HttpError && [401, 403].includes(error.status);
 }
 
-export function errorToString(error: Error) {
+export function isRateLimitExceededError(error: any) {
+  return error instanceof HttpError && error.status === 429;
+}
+
+function errorToString(error: Error) {
   let message = error.message || error.toString();
   if (error.cause instanceof Error) {
     message += "\nCaused by: " + errorToString(error.cause);
   }
   return message;
+}
+
+export function formatErrorMessage(error: unknown) {
+  return error instanceof Error ? errorToString(error) : JSON.stringify(error);
 }

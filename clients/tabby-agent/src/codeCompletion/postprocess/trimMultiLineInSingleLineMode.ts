@@ -1,11 +1,11 @@
 import { PostprocessFilter, logger } from "./base";
-import { CompletionItem } from "../solution";
+import { CompletionResultItem, emptyCompletionResultItem } from "../solution";
+import { CompletionContext } from "../contexts";
 
 export function trimMultiLineInSingleLineMode(): PostprocessFilter {
-  return (item: CompletionItem): CompletionItem => {
-    const context = item.context;
+  return (item: CompletionResultItem, context: CompletionContext): CompletionResultItem => {
     const inputLines = item.lines;
-    if (context.mode === "fill-in-line" && inputLines.length > 1) {
+    if (!context.isLineEnd && inputLines.length > 1) {
       const suffix = context.currentLineSuffix.trimEnd();
       const inputLine = inputLines[0]!.trimEnd();
       if (inputLine.endsWith(suffix)) {
@@ -16,7 +16,7 @@ export function trimMultiLineInSingleLineMode(): PostprocessFilter {
         }
       }
       logger.trace("Drop content with multiple lines.", { inputLines });
-      return CompletionItem.createBlankItem(context);
+      return emptyCompletionResultItem;
     }
     return item;
   };

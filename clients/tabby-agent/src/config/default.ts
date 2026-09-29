@@ -4,7 +4,11 @@ import generateCommitMessagePrompt from "../chat/prompts/generate-commit-message
 import generateDocsPrompt from "../chat/prompts/generate-docs.md";
 import editCommandReplacePrompt from "../chat/prompts/edit-command-replace.md";
 import editCommandInsertPrompt from "../chat/prompts/edit-command-insert.md";
-
+import generateSmartApplyPrompt from "../chat/prompts/generate-smart-apply.md";
+import provideSmartApplyLineRangePrompt from "../chat/prompts/provide-smart-apply-line-range.md";
+import includeFileContextList from "../chat/prompts/include-file-context-list.md";
+import includeFileContextItem from "../chat/prompts/include-file-context-item.md";
+import generateBranchNamePrompt from "../chat/prompts/generate-branch-name.md";
 export const defaultConfigData: ConfigData = {
   server: {
     endpoint: "http://localhost:8080",
@@ -38,6 +42,11 @@ export const defaultConfigData: ConfigData = {
           overlapLines: 1,
         },
       },
+      collectSnippetsFromRecentOpenedFiles: {
+        enabled: true,
+        maxOpenedFiles: 5,
+        maxCharsPerOpenedFiles: 500,
+      },
       clipboard: {
         minChars: 3,
         maxChars: 2000,
@@ -60,8 +69,15 @@ export const defaultConfigData: ConfigData = {
   },
   chat: {
     edit: {
+      // FIXME(@icycodes): use one config for max length of final prompt length,
+      // instead of documentMaxChars, commandMaxChars, fileContext.maxFiles and fileContext.maxCharsPerFile
       documentMaxChars: 3000,
       commandMaxChars: 200,
+      fileContext: {
+        maxFiles: 5,
+        maxCharsPerFile: 3000,
+        promptTemplate: [includeFileContextList, includeFileContextItem],
+      },
       responseDocumentTag: ["<GENERATEDCODE>", "</GENERATEDCODE>"],
       responseCommentTag: undefined,
       promptTemplate: {
@@ -87,7 +103,17 @@ export const defaultConfigData: ConfigData = {
       maxDiffLength: 3600,
       promptTemplate: generateCommitMessagePrompt,
       responseMatcher:
-        /(?<=(["'`]+)?\s*)(feat|fix|docs|refactor|style|test|build|ci|chore)(\(\S+\))?:.+(?=\s*\1)/gis.toString(),
+        /^(?:(?!!\[|^\[.*\]:\s*http).*?)(?:["'`]?)?((?:feat|fix|docs|refactor|style|test|build|ci|chore)(?:\(\S+\))?:.+?)(?:["'`])?(?:\n|$)/ims.toString(),
+    },
+    generateBranchName: {
+      maxDiffLength: 3600,
+      promptTemplate: generateBranchNamePrompt,
+    },
+    smartApplyLineRange: {
+      promptTemplate: provideSmartApplyLineRangePrompt,
+    },
+    smartApply: {
+      promptTemplate: generateSmartApplyPrompt,
     },
   },
   logs: {

@@ -2,14 +2,19 @@
 
 import React, { useEffect, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
+import useSWR from 'swr'
 import { useQuery } from 'urql'
+import * as z from 'zod'
 
 import { DEFAULT_PAGE_SIZE } from '@/lib/constants'
 import {
   IntegrationKind,
   IntegrationStatus,
-  ListIntegratedRepositoriesQuery
+  ListIntegratedRepositoriesQuery,
+  ListIntegrationsQuery
 } from '@/lib/gql/generates/graphql'
 import { useDebounceCallback } from '@/lib/hooks/use-debounce'
 import {
@@ -34,12 +39,23 @@ import {
   DialogTitle
 } from '@/components/ui/dialog'
 import {
+  Form,
+  FormControl,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage
+} from '@/components/ui/form'
+import {
   IconChevronLeft,
   IconChevronRight,
+  IconPencil,
   IconPlus,
   IconSpinner,
   IconTrash
 } from '@/components/ui/icons'
+import { Input } from '@/components/ui/input'
 import { ScrollArea, ScrollBar } from '@/components/ui/scroll-area'
 import {
   Table,
@@ -49,6 +65,12 @@ import {
   TableHeader,
   TableRow
 } from '@/components/ui/table'
+import { TagInput } from '@/components/ui/tag-input'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger
+} from '@/components/ui/tooltip'
 import LoadingWrapper from '@/components/loading-wrapper'
 import { ListSkeleton } from '@/components/skeleton'
 
@@ -56,7 +78,10 @@ import { AccessPolicyView } from '../../../components/access-policy-view'
 import { JobInfoView } from '../../../components/job-trigger'
 import { triggerJobRunMutation } from '../../../query'
 import { useIntegrationKind } from '../../hooks/use-repository-kind'
-import { updateIntegratedRepositoryActiveMutation } from '../query'
+import {
+  updateIntegratedRepositoryActiveMutation,
+  updateIntegratedRepositoryRefsMutation
+} from '../query'
 import AddRepositoryForm from './add-repository-form'
 import { UpdateProviderForm } from './update-provider-form'
 
@@ -77,6 +102,20 @@ const ProviderDetail: React.FC = () => {
     pause: !id || !kind
   })
   const provider = data?.integrations?.edges?.[0]?.node
+  const shouldRefreshProvider = provider?.status === IntegrationStatus.Pending
+
+  useSWR(
+    shouldRefreshProvider ? 'refresh' : null,
+    () => {
+      reexecuteQuery()
+    },
+    {
+      revalidateOnFocus: true,
+      revalidateOnReconnect: true,
+      revalidateOnMount: false,
+      refreshInterval: 5 * 1000
+    }
+  )
 
   const onDeleteProvider = () => {
     router.back()
@@ -108,9 +147,7 @@ const ProviderDetail: React.FC = () => {
           <span className="ml-1">{provider?.displayName}</span>
         </div>
         <div className="flex items-center gap-2 text-base">
-          <div className="ml-1">
-            {provider && toStatusBadge(provider.status)}
-          </div>
+          <div className="ml-1">{provider && toStatusBadge(provider)}</div>
         </div>
       </CardTitle>
       <CardContent className="mt-8">
@@ -180,6 +217,21 @@ const ActiveRepoTable: React.FC<{
     }
   }
 
+  useSWR(
+    ['refresh_repos', page],
+    ([, p]) => {
+      fetchRepositoriesSequentially(p).then(res =>
+        setActiveRepositoriesResult(res)
+      )
+    },
+    {
+      revalidateOnFocus: true,
+      revalidateOnReconnect: true,
+      revalidateOnMount: false,
+      refreshInterval: 10 * 1000
+    }
+  )
+
   const [activeRepositoriesResult, setActiveRepositoriesResult] =
     React.useState<QueryResponseData<typeof listIntegratedRepositories>>()
   const [fetching, setFetching] = React.useState(true)
@@ -187,6 +239,12 @@ const ActiveRepoTable: React.FC<{
     React.useState<IntegratedRepositories>([])
   const activeRepos = activeRepositoriesResult?.integratedRepositories?.edges
   const pageInfo = activeRepositoriesResult?.integratedRepositories?.pageInfo
+  const [editingRepo, setEditingRepo] = React.useState<{
+    id: string
+    displayName: string
+    gitUrl: string
+    refs: string[]
+  } | null>(null)
 
   const updateProvidedRepositoryActive = useMutation(
     updateIntegratedRepositoryActiveMutation,
@@ -196,6 +254,52 @@ const ActiveRepoTable: React.FC<{
       }
     }
   )
+
+  const updateProvidedRepositoryRefs = useMutation(
+    updateIntegratedRepositoryRefsMutation,
+    {
+      onError(error) {
+        toast.error(error.message || 'Failed to update')
+      }
+    }
+  )
+
+  const handleUpdateRepository = (values: { refs?: string[] }) => {
+    if (!editingRepo) return
+
+    updateProvidedRepositoryRefs({
+      id: editingRepo.id,
+      refs: values.refs && values.refs.length > 0 ? values.refs : []
+    }).then(res => {
+      if (res?.data?.updateIntegratedRepositoryRefs) {
+        toast.success('Repository updated successfully')
+        setEditingRepo(null)
+        loadPage(page)
+      }
+    })
+  }
+
+  const handleEditRepository = (repo: {
+    id: string
+    displayName: string
+    gitUrl: string
+    refs: Array<{ name: string }>
+  }) => {
+    setEditingRepo({
+      id: repo.id,
+      displayName: repo.displayName,
+      gitUrl: repo.gitUrl,
+      refs: repo.refs.map(r => {
+        // Extract branch name from refs/heads/xxx or refs/tags/xxx
+        if (r.name.startsWith('refs/heads/')) {
+          return r.name.substring('refs/heads/'.length)
+        } else if (r.name.startsWith('refs/tags/')) {
+          return r.name.substring('refs/tags/'.length)
+        }
+        return r.name
+      })
+    })
+  }
 
   const triggerJobRun = useMutation(triggerJobRunMutation)
 
@@ -284,111 +388,130 @@ const ActiveRepoTable: React.FC<{
   return (
     <>
       <LoadingWrapper loading={fetching}>
-        <Table className="table-fixed">
-          <TableHeader>
-            <TableRow>
-              <TableHead className="w-[25%]">Name</TableHead>
-              <TableHead className="w-[35%]">URL</TableHead>
-              <TableHead className="w-[140px]">Access</TableHead>
-              <TableHead className="w-[180px]">Job</TableHead>
-              <TableHead className="w-[60px] text-right">
-                <Button
-                  variant="outline"
-                  size="icon"
-                  className="shadow-none"
-                  onClick={e => setOpen(true)}
-                >
-                  <IconPlus />
-                </Button>
-              </TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {activeRepos?.length || recentlyActivatedRepositories?.length ? (
-              <>
-                {recentlyActivatedRepositories?.map(x => {
-                  return (
-                    <TableRow key={x.node.id} className="!bg-muted/80">
-                      <TableCell className="break-all lg:break-words">
-                        {x.node.displayName}
-                      </TableCell>
-                      <TableCell className="break-all lg:break-words">
-                        {x.node.gitUrl}
-                      </TableCell>
-                      <TableCell></TableCell>
-                      <TableCell></TableCell>
-                      <TableCell className="flex justify-end">
-                        <div
-                          className={buttonVariants({
-                            variant: 'ghost',
-                            size: 'icon'
-                          })}
-                        >
-                          <IconSpinner />
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-                {activeRepos?.map(x => {
-                  return (
-                    <TableRow key={x.node.id}>
-                      <TableCell className="break-all lg:break-words">
-                        {x.node.displayName}
-                      </TableCell>
-                      <TableCell className="break-all lg:break-words">
-                        {x.node.gitUrl}
-                      </TableCell>
-                      <TableCell className="break-all lg:break-words">
-                        <AccessPolicyView
-                          sourceId={x.node.sourceId}
-                          sourceName={x.node.displayName}
-                          editable
-                          fetchingUserGroups={fetchingUserGroups}
-                          userGroups={userGroupData?.userGroups}
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <JobInfoView
-                          jobInfo={x.node.jobInfo}
-                          onTrigger={() =>
-                            handleTriggerJobRun(x.node.jobInfo.command)
-                          }
-                        />
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          size="icon"
-                          variant="hover-destructive"
-                          onClick={e =>
-                            handleDelete(x, activeRepos?.length === 1)
-                          }
-                        >
-                          <IconTrash />
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </>
-            ) : (
+        <ScrollArea>
+          <Table className="min-w-[400px]">
+            <TableHeader>
               <TableRow>
-                <TableCell
-                  colSpan={5}
-                  className="h-[100px] text-center hover:bg-background"
-                >
-                  <div className="mt-4 flex flex-col items-center gap-4">
-                    <span>No repositories</span>
-                    <Button onClick={e => setOpen(true)} className="gap-1">
-                      <IconPlus />
-                      Add
-                    </Button>
-                  </div>
-                </TableCell>
+                <TableHead className="w-[25%]">Name</TableHead>
+                <TableHead className="w-[35%]">URL</TableHead>
+                <TableHead className="w-[140px]">Access</TableHead>
+                <TableHead>Job</TableHead>
+                <TableHead className="w-[60px] text-right">
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="shadow-none"
+                    onClick={e => setOpen(true)}
+                  >
+                    <IconPlus />
+                  </Button>
+                </TableHead>
               </TableRow>
-            )}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {activeRepos?.length || recentlyActivatedRepositories?.length ? (
+                <>
+                  {recentlyActivatedRepositories?.map(x => {
+                    return (
+                      <TableRow key={x.node.id} className="!bg-muted/80">
+                        <TableCell className="break-all lg:break-words">
+                          {x.node.displayName}
+                        </TableCell>
+                        <TableCell className="break-all lg:break-words">
+                          {x.node.gitUrl}
+                        </TableCell>
+                        <TableCell></TableCell>
+                        <TableCell></TableCell>
+                        <TableCell className="flex justify-end">
+                          <div
+                            className={buttonVariants({
+                              variant: 'ghost',
+                              size: 'icon'
+                            })}
+                          >
+                            <IconSpinner />
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                  {activeRepos?.map(x => {
+                    return (
+                      <TableRow key={x.node.id}>
+                        <TableCell className="break-all lg:break-words">
+                          {x.node.displayName}
+                        </TableCell>
+                        <TableCell className="break-all lg:break-words">
+                          {x.node.gitUrl}
+                        </TableCell>
+                        <TableCell className="break-all lg:break-words">
+                          <AccessPolicyView
+                            sourceId={x.node.sourceId}
+                            sourceName={x.node.displayName}
+                            editable
+                            fetchingUserGroups={fetchingUserGroups}
+                            userGroups={userGroupData?.userGroups}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <JobInfoView
+                            jobInfo={x.node.jobInfo}
+                            onTrigger={() =>
+                              handleTriggerJobRun(x.node.jobInfo.command)
+                            }
+                          />
+                        </TableCell>
+                        <TableCell className="text-right">
+                          <div className="flex justify-end gap-2">
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              onClick={() =>
+                                handleEditRepository({
+                                  id: x.node.id,
+                                  displayName: x.node.displayName,
+                                  gitUrl: x.node.gitUrl,
+                                  refs: x.node.refs
+                                })
+                              }
+                            >
+                              <IconPencil />
+                            </Button>
+                            <Button
+                              size="icon"
+                              variant="hover-destructive"
+                              onClick={e =>
+                                handleDelete(x, activeRepos?.length === 1)
+                              }
+                            >
+                              <IconTrash />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </>
+              ) : (
+                <TableRow>
+                  <TableCell
+                    colSpan={5}
+                    className="h-[100px] text-center hover:bg-background"
+                  >
+                    <div className="mt-4 flex flex-col items-center gap-4">
+                      <span>No repositories</span>
+                      <Button onClick={e => setOpen(true)} className="gap-1">
+                        <IconPlus />
+                        Add
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+          <ScrollBar orientation="horizontal" />
+        </ScrollArea>
         {(page > 1 || pageInfo?.hasNextPage) && (
           <div className="mt-2 flex justify-end">
             <div className="flex w-[100px] items-center justify-center text-sm font-medium">
@@ -421,7 +544,7 @@ const ActiveRepoTable: React.FC<{
         )}
       </LoadingWrapper>
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogContent className="top-[20vh]">
+        <DialogContent>
           <DialogHeader className="gap-3">
             <DialogTitle>Add new repository</DialogTitle>
             <DialogDescription>
@@ -438,16 +561,161 @@ const ActiveRepoTable: React.FC<{
           />
         </DialogContent>
       </Dialog>
+      <EditRepositoryDialog
+        repo={editingRepo}
+        open={!!editingRepo}
+        onOpenChange={open => {
+          if (!open) setEditingRepo(null)
+        }}
+        onSubmit={handleUpdateRepository}
+      />
     </>
   )
 }
 
-function toStatusBadge(status: IntegrationStatus) {
-  switch (status) {
+const editFormSchema = z.object({
+  refs: z.array(z.string()).optional()
+})
+
+type EditFormValues = z.infer<typeof editFormSchema>
+
+function EditRepositoryDialog({
+  repo,
+  open,
+  onOpenChange,
+  onSubmit
+}: {
+  repo: {
+    id: string
+    displayName: string
+    gitUrl: string
+    refs: string[]
+  } | null
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  onSubmit: (values: EditFormValues) => void
+}) {
+  const form = useForm<EditFormValues>({
+    resolver: zodResolver(editFormSchema)
+  })
+
+  React.useEffect(() => {
+    if (repo) {
+      form.reset({
+        refs: repo.refs
+      })
+    }
+  }, [repo, form])
+
+  const { isSubmitting } = form.formState
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-xl">
+        <DialogHeader>
+          <DialogTitle>Edit Repository</DialogTitle>
+          <DialogDescription>
+            Update the repository branches to index
+          </DialogDescription>
+        </DialogHeader>
+        <Form {...form}>
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+            <FormItem>
+              <FormLabel>Name</FormLabel>
+              <FormControl>
+                <Input
+                  value={repo?.displayName}
+                  disabled={true}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+            <FormItem>
+              <FormLabel>Git URL</FormLabel>
+              <FormDescription>Remote or local Git URL</FormDescription>
+              <FormControl>
+                <Input
+                  value={repo?.gitUrl}
+                  disabled={true}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                />
+              </FormControl>
+              <FormMessage />
+            </FormItem>
+            <FormField
+              control={form.control}
+              name="refs"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Branches</FormLabel>
+                  <FormDescription>
+                    Branches to index (press Enter to select, leave empty for
+                    default branch)
+                  </FormDescription>
+                  <FormControl>
+                    <TagInput
+                      placeholder="e.g. main"
+                      autoCapitalize="none"
+                      autoCorrect="off"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <div className="flex justify-end gap-4">
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={isSubmitting}
+                onClick={() => onOpenChange(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={isSubmitting}>
+                Update
+              </Button>
+            </div>
+          </form>
+        </Form>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function toStatusBadge(
+  node: ListIntegrationsQuery['integrations']['edges'][0]['node']
+) {
+  switch (node.status) {
     case IntegrationStatus.Ready:
       return <Badge variant="successful">Ready</Badge>
-    case IntegrationStatus.Failed:
-      return <Badge variant="destructive">Error</Badge>
+    case IntegrationStatus.Failed: {
+      return (
+        <Tooltip delayDuration={0}>
+          <TooltipTrigger>
+            <Badge variant="destructive">Error</Badge>
+          </TooltipTrigger>
+          <TooltipContent>
+            {node.message ? (
+              <div>
+                <p className="mb-2">{node.message}</p>
+                Please verify your context provider settings to resolve the
+                issue
+              </div>
+            ) : (
+              <p>
+                Processing error. Please check if the access token is still
+                valid
+              </p>
+            )}
+          </TooltipContent>
+        </Tooltip>
+      )
+    }
     case IntegrationStatus.Pending:
       return <Badge>Pending</Badge>
   }

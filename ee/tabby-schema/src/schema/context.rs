@@ -22,17 +22,19 @@ pub enum ContextSourceKind {
     Gitlab,
     Doc,
     Web,
+    Page,
+    Ingested,
 }
 
 #[graphql_interface]
-#[graphql(context = Context, for = [ProvidedRepository, GitRepository, ContextSourceValue, CustomWebDocument, PresetWebDocument, Repository, WebContextSource])]
+#[graphql(context = Context, for = [ProvidedRepository, GitRepository, ContextSourceValue, CustomWebDocument, PresetWebDocument, Repository, WebContextSource, PageContextSource, IngestedContextSource])]
 pub trait ContextSourceId {
     /// Represents the source of the context, which is the value mapped to `source_id` in the index.
     fn source_id(&self) -> String;
 }
 
 #[derive(GraphQLInterface)]
-#[graphql(context = Context, impl = [ContextSourceIdValue], for = [CustomWebDocument, PresetWebDocument, Repository, WebContextSource])]
+#[graphql(context = Context, impl = [ContextSourceIdValue], for = [CustomWebDocument, PresetWebDocument, Repository, WebContextSource, PageContextSource, IngestedContextSource])]
 pub struct ContextSource {
     pub id: ID,
 
@@ -52,6 +54,8 @@ impl ContextSourceValue {
             ContextSourceValueEnum::CustomWebDocument(x) => x.source_id(),
             ContextSourceValueEnum::PresetWebDocument(x) => x.source_id(),
             ContextSourceValueEnum::WebContextSource(x) => x.source_id().into(),
+            ContextSourceValueEnum::PageContextSource(x) => x.source_id().into(),
+            ContextSourceValueEnum::IngestedContextSource(x) => x.source_id().into(),
         }
     }
 
@@ -61,6 +65,8 @@ impl ContextSourceValue {
             ContextSourceValueEnum::CustomWebDocument(x) => x.source_name().into(),
             ContextSourceValueEnum::PresetWebDocument(x) => x.source_name().into(),
             ContextSourceValueEnum::WebContextSource(x) => x.source_name().into(),
+            ContextSourceValueEnum::PageContextSource(x) => x.source_name().into(),
+            ContextSourceValueEnum::IngestedContextSource(x) => x.source_name().into(),
         }
     }
 }
@@ -88,6 +94,55 @@ impl WebContextSource {
     }
 }
 
+pub struct PageContextSource;
+
+const PAGE_SOURCE_ID: &str = "page";
+
+#[graphql_object(context = Context, impl = [ContextSourceIdValue, ContextSourceValue])]
+impl PageContextSource {
+    fn id(&self) -> ID {
+        ID::new(PAGE_SOURCE_ID.to_owned())
+    }
+
+    fn source_kind(&self) -> ContextSourceKind {
+        ContextSourceKind::Page
+    }
+
+    pub fn source_id(&self) -> &'static str {
+        PAGE_SOURCE_ID
+    }
+
+    pub fn source_name(&self) -> &'static str {
+        "Page"
+    }
+}
+
+pub struct IngestedContextSource {
+    pub id: String,
+    pub name: String,
+}
+
+const INGESTED_SOURCE_ID_PREFIX: &str = "ingested:";
+
+#[graphql_object(context = Context, impl = [ContextSourceIdValue, ContextSourceValue])]
+impl IngestedContextSource {
+    fn id(&self) -> ID {
+        ID::new(self.id.clone())
+    }
+
+    fn source_kind(&self) -> ContextSourceKind {
+        ContextSourceKind::Ingested
+    }
+
+    pub fn source_id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn source_name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[derive(GraphQLObject)]
 #[graphql(context = Context)]
 pub struct ContextInfo {
@@ -104,7 +159,11 @@ impl ContextInfo {
         repositories.reserve(self.sources.len());
         for x in &self.sources {
             if let ContextSourceValueEnum::Repository(x) = x {
-                repositories.push(CodeRepository::new(&x.git_url, &x.source_id));
+                repositories.push(CodeRepository::new(
+                    &x.git_url,
+                    &x.source_id,
+                    x.refs.iter().map(|r| r.name.clone()).collect(),
+                ));
             }
         }
 
@@ -134,7 +193,10 @@ impl ContextInfoHelper {
         let re = Regex::new(r"\[\[source:(.*?)\]\]").unwrap();
         let new_content = re.replace_all(content, |caps: &Captures| {
             let source_id = caps.get(1).unwrap().as_str();
-            if source_id == PUBLIC_WEB_INTERNAL_SOURCE_ID {
+            if source_id == PUBLIC_WEB_INTERNAL_SOURCE_ID
+                || source_id == PAGE_SOURCE_ID
+                || source_id.starts_with(INGESTED_SOURCE_ID_PREFIX)
+            {
                 // For public-web source, don't include it in the content.
                 return "".to_owned();
             }

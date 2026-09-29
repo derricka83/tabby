@@ -1,3 +1,149 @@
+## 1.26.0
+
+### Features
+
+- **Chat Panel**:
+
+  - Requires Tabby Server `0.27.0` or later.
+  - Added support for executing suggested shell scripts directly via a button in the code component, similar to the `Apply in Editor` feature.
+  - Added support for using `@changes` to include the current Git diff into the context.
+  - You can now select code in the editor and use the `Code Review` option from the context menu to review your code and add comments using Tabby Chat.
+  - Improved the UI for file and symbol context included by `@`.
+
+- **Code Completion**:
+
+  - Added support for disabling code completion for specific languages. This can be configured via the status bar item menu or in advanced settings.
+
+- **Inline Edit**:
+
+  - Added support for including symbols as context. Use `@` to trigger a quick pick and select `Symbols` to choose available items.
+
+- **Git Integration**:
+  - Improved the `Generate Commit Messages` command. After generating commit messages, if you are still on the `main` or `master` branch, Tabby will automatically prompt you to create a new branch with suggested branch names.
+  - Added a new `Create Branch with Suggestions` command, accessible from the command palette.
+
+## 1.24.0
+
+### Features
+
+- **Chat**:
+  - Requires a server version of 0.26.0 or later.
+  - Added support to view recent chat history in the chat panel.
+- Added support for other extensions to read Tabby server configurations after user grants permission.
+
+### Fixes & Improvements
+
+- **Inline Edit**: Added keyboard shortcut hints for `Accept` and `Discard` actions in the inline edit preview.
+- Fixed the status bar item not updating when disconnected from the server.
+
+## 1.22.0
+
+### Features
+
+- **Chat**:
+  - Requires a server version of 0.25.0 or later.
+  - You can now use `@` to add a selected symbol (functions, variables, etc.) as context for the chat conversation when typing in the chat panel.
+- **Inline Edit**:
+  - You can now use `@` to add a selected file as context for the inline edit.
+  - The edit preview now shows color decoration for character diffs.
+
+### Fixes & Improvements
+
+- Optimized the display of file paths in the chat panel.
+- Fixed a bug causing incorrect indentation when the code uses tab indentation.
+
+## 1.20.1
+
+### Fixes & Improvements
+
+- **Chat**: Optimized file search performance when using `@` to add file context.
+
+## 1.20.0
+
+### Features
+
+- **Chat**:
+  - You can now use `@` to add a selected file as context for the chat conversation when typing in the chat panel. (Requires connecting to a Tabby server version 0.24.0 or later.)
+- Added an inline edit option in the editor right-click context menu.
+
+### Fixes & Improvements
+
+- Retained the chat conversation when moving the chat panel to a different view group. (Requires connecting to a Tabby server version 0.24.0 or later.)
+- The chat panel now uses the active editor as context by default.
+- Fixed the handling of inline edit cancellations.
+
+## 1.18.0
+
+### Features
+
+- **Chat**:
+  - Added support to explicitly select a configured Git repository as the context for chat conversations.
+  - Added support to use the active Notebook editor selection as the context for chat conversations.
+  - Display error messages and suggest actions when failing to load the chat panel.
+  - **Note**: Requires updating the Tabby server to version 0.23.0 or later.
+
+### Fixes & Improvements
+
+- Updated the status bar item to show warning when the server returns an error due to too many requests.
+- Improved the UI for the Tabby command palette and when updating the token.
+
+## 1.16.0
+
+### Features
+
+- **Chat**:
+  - Symbols referenced in the chat response can now be clicked to navigate to their definitions.
+  - **Note**: Requires updating the Tabby server to version 0.21.2, 0.22.0, or later.
+- **Code Completion**:
+  - Now provides inline completion even when the completion widget is open, based on the selected item in the widget.
+  - Automatically adds import statements if needed after accepting a completion that uses a symbol requiring an import.
+
+### Fixes & Improvements
+
+- Streamlined the `Tabby: Connect to Server...` command process and added a server history list for quick selection.
+- **Code Completion**: Added a post-processing filter to fix an issue where some code completions contained an extra space in the indentation for certain code completion models.
+- **Chat**: Improved the feature to automatically use the active selection code as context.
+- **Chat**: Fixed a bug where dragging the chat panel to the right or bottom side of the editor caused it to be blank.
+- The HTTP proxy in VSCode settings is no longer used by default. Added an option to enable it.
+
+## 1.14.0
+
+### Features
+
+- Introduced a "Smart Apply" button in the chat panel's generated code block. This feature suggests edits directly in the current editor, enabling users to apply generated code quickly without manual intervention. Note: Requires the latest version of the Tabby server.
+- Added a dynamic indicator in the chat panel's input box to show the currently selected text, which will be used as context for the chat conversation. Note: Requires the latest version of the Tabby server.
+
+### Fixes & Improvements
+
+- Resolved an issue where the chat panel's file context navigation failed when the VSCode workspace was not at the root of the git repository containing the target file.
+- Fixed a bug where inline completion did not function in the web extension for browsers when opening remote repositories, such as those from GitHub.
+- Corrected the storage of user data in the web extension for browsers.
+
+## 1.12.5
+
+### Fixes & Improvements
+
+- Fixed a bug where the inline completion provider was incorrectly registered twice, causing the status bar loading indicator to not correctly show ongoing completion requests.
+
+## 1.12.4
+
+### Fixes & Improvements
+
+- Fixed a bug causing the Tabby web extension to not initialize in browsers. (https://github.com/TabbyML/tabby/issues/3302)
+
+## 1.12.3
+
+### Fixes & Improvements
+
+- Fixed an issue where the chat panel failed to display when the endpoint configuration ended with a trailing slash.
+- Improved the context of code completion by adding support for collecting code snippets from recently viewed editors.
+
+## 1.12.2
+
+### Fixes & Improvements
+
+- Fixed a bug that caused the Tabby extension to not initialize when TLS certificates failed to load. (https://github.com/TabbyML/tabby/issues/3248)
+
 ## 1.12.1
 
 ### Fixes & Improvements

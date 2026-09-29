@@ -76,7 +76,7 @@ impl IntegrationService for IntegrationServiceImpl {
             bail!("Self-hosted integrations must specify an API base");
         }
 
-        let integration = self.get_integration(id.clone()).await?;
+        let integration = self.get_integration(&id).await?;
         let access_token_is_changed = access_token
             .as_ref()
             .is_some_and(|token| token != &integration.access_token);
@@ -129,11 +129,11 @@ impl IntegrationService for IntegrationServiceImpl {
             .collect::<Result<_, _>>()?)
     }
 
-    async fn get_integration(&self, id: ID) -> Result<Integration> {
+    async fn get_integration(&self, id: &ID) -> Result<Integration> {
         Ok(self.db.get_integration(id.as_rowid()?).await?.try_into()?)
     }
 
-    async fn update_integration_sync_status(&self, id: ID, error: Option<String>) -> Result<()> {
+    async fn update_integration_sync_status(&self, id: &ID, error: Option<String>) -> Result<()> {
         self.db
             .update_integration_error(id.as_rowid()?, error)
             .await?;
@@ -184,27 +184,27 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
         assert_eq!(provider.display_name, "id2");
         assert_eq!(provider.status, IntegrationStatus::Pending);
 
         // Test updating error status for gitlab provider
         tokio::time::sleep(Duration::from_secs(1)).await;
         integration
-            .update_integration_sync_status(id.clone(), Some("error".into()))
+            .update_integration_sync_status(&id, Some("error".into()))
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
         assert_eq!(provider.status, IntegrationStatus::Failed);
 
         // Test successful status (no error)
         integration
-            .update_integration_sync_status(id.clone(), None)
+            .update_integration_sync_status(&id, None)
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
         assert_eq!(provider.status, IntegrationStatus::Ready);
 
         // Deleting using github integration kind should fail since this is a gitlab integration
@@ -246,11 +246,11 @@ mod tests {
 
         // Test integration status is failed after updating sync status with an error
         integration
-            .update_integration_sync_status(id.clone(), Some("error".into()))
+            .update_integration_sync_status(&id, Some("error".into()))
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
 
         assert_eq!(provider.status, IntegrationStatus::Failed);
 
@@ -266,7 +266,7 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
 
         assert_eq!(provider.status, IntegrationStatus::Failed);
 
@@ -282,13 +282,13 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
 
         assert_eq!(provider.status, IntegrationStatus::Pending);
 
         // Test integration status is ready after a successful sync and an update which changes no fields
         integration
-            .update_integration_sync_status(id.clone(), None)
+            .update_integration_sync_status(&id, None)
             .await
             .unwrap();
         integration
@@ -296,7 +296,7 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = integration.get_integration(id.clone()).await.unwrap();
+        let provider = integration.get_integration(&id).await.unwrap();
 
         assert_eq!(provider.status, IntegrationStatus::Ready);
 

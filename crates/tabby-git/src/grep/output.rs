@@ -118,7 +118,7 @@ fn read_lines(content: &[u8]) -> anyhow::Result<Vec<GrepLine>> {
     let mut byte_offset = 0;
     for line in line_reader {
         let line = line? + "\n";
-        let bytes_length = line.as_bytes().len();
+        let bytes_length = line.len();
         lines.push(GrepLine {
             line: GrepTextOrBase64::Text(line),
             byte_offset,
@@ -138,7 +138,7 @@ pub struct GrepMatchSink<'output, 'a> {
     matcher: &'a RegexMatcher,
 }
 
-impl<'output, 'a> Sink for GrepMatchSink<'output, 'a> {
+impl Sink for GrepMatchSink<'_, '_> {
     type Error = std::io::Error;
 
     fn matched(
@@ -201,7 +201,7 @@ pub struct GrepNegativeMatchSink<'output> {
     output: &'output mut GrepOutput,
 }
 
-impl<'output> Sink for GrepNegativeMatchSink<'output> {
+impl Sink for GrepNegativeMatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(

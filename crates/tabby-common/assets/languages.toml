@@ -337,6 +337,11 @@ exts = ["md", "markdown"]
 chunk_size = 1536
 
 [[config]]
+languages = ["txt"]
+exts = ["txt"]
+chunk_size = 1536
+
+[[config]]
 languages = ["perl"]
 exts = ["pl", "pm", "pod", "perl"]
 
@@ -350,7 +355,44 @@ exts = ["sql"]
 
 [[config]]
 languages = ["scala"]
-exts = ["scala"]
+exts = ["scala", "sbt"]
+line_comment = "//"
+top_level_keywords = [
+    "abstract",
+    "case",
+    "class",
+    "def",
+    "do",
+    "else",
+    "enum",
+    "extends",
+    "final",
+    "for",
+    "given",
+    "if",
+    "implicit",
+    "import",
+    "lazy",
+    "match",
+    "new",
+    "object",
+    "override",
+    "package",
+    "private",
+    "protected",
+    "return",
+    "sealed",
+    "then",
+    "throw",
+    "trait",
+    "try",
+    "type",
+    "val",
+    "var",
+    "while",
+    "with",
+    "yield",
+]
 
 [[config]]
 languages = ["shellscript"]
@@ -414,4 +456,18 @@ top_level_keywords = [
   "when",
   "while",
   "with",
+]
+
+[[config]]
+languages = ["gdscript"]
+exts = ["gd", "tscn", "tres"]
+line_comment = "#"
+top_level_keywords = [
+    "var",
+    "const",
+    "enum",
+    "func",
+    "class",
+    "class_name",
+    "extends",
 ]

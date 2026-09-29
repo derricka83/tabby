@@ -10,6 +10,10 @@ fn main() {
 
     let mut config = Config::new("./llama.cpp");
     config.profile("Release");
+
+    // Tabby handles model downloads, thus turn the download feature off in llama.cpp.
+    config.define("LLAMA_CURL", "OFF");
+
     config.define("GGML_NATIVE", "OFF");
     config.define("GGML_NATIVE_DEFAULT", "OFF");
     config.define("BUILD_SHARED_LIBS", "OFF");
@@ -49,15 +53,15 @@ fn main() {
 
         let rocm_root = env::var("ROCM_ROOT").unwrap_or("/opt/rocm".to_string());
         config.define("GGML_HIPBLAS", "ON");
-        config.define("CMAKE_C_COMPILER", format!("{}/llvm/bin/clang", rocm_root));
+        config.define("CMAKE_C_COMPILER", format!("{rocm_root}/llvm/bin/clang"));
         config.define(
             "CMAKE_CXX_COMPILER",
-            format!("{}/llvm/bin/clang++", rocm_root),
+            format!("{rocm_root}/llvm/bin/clang++"),
         );
         config.define("AMDGPU_TARGETS", amd_gpu_targets.join(";"));
     }
     if cfg!(feature = "vulkan") {
-        config.define("LLAMA_VULKAN", "ON");
+        config.define("GGML_VULKAN", "ON");
     }
 
     let out = config.build();

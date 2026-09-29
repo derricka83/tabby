@@ -4,6 +4,23 @@ import useSWR, { SWRResponse } from 'swr'
 
 import fetcher from '@/lib/tabby/fetcher'
 
+type LocalModel = {
+  model_id: string
+  device: string
+  cuda_devices?: string[]
+}
+
+type RemoteModel = {
+  kind: string
+  model_name?: string
+  api_endpoint: string
+}
+
+type ModelInfo = {
+  local?: LocalModel
+  remote?: RemoteModel
+}
+
 export interface HealthInfo {
   device: 'metal' | 'cpu' | 'cuda'
   model?: string
@@ -16,6 +33,11 @@ export interface HealthInfo {
     build_date: string
     git_describe: string
   }
+  models: {
+    chat?: ModelInfo
+    completion?: ModelInfo
+    embedding: ModelInfo
+  }
 }
 
 export function useHealth(): SWRResponse<HealthInfo> {
@@ -23,8 +45,8 @@ export function useHealth(): SWRResponse<HealthInfo> {
     '/v1/health',
     (url: string) => {
       return fetcher(url, {
-        errorHandler: () => {
-          throw new Error('Unhealth')
+        errorHandler: response => {
+          throw new Error(response?.statusText.toString() || 'Unhealth')
         }
       })
     },

@@ -54,6 +54,7 @@ CREATE TABLE repositories(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name VARCHAR(255) NOT NULL,
   git_url VARCHAR(255) NOT NULL,
+  refs TEXT,
   CONSTRAINT `idx_name` UNIQUE(`name`)
   CONSTRAINT `idx_git_url` UNIQUE(`git_url`)
 );
@@ -63,7 +64,10 @@ CREATE TABLE server_setting(
   security_disable_client_side_telemetry BOOLEAN NOT NULL DEFAULT FALSE,
   network_external_url STRING NOT NULL DEFAULT 'http://localhost:8080'
   ,
-  billing_enterprise_license STRING
+  billing_enterprise_license STRING,
+  security_disable_password_login BOOLEAN NOT NULL DEFAULT FALSE,
+  branding_logo TEXT DEFAULT NULL,
+  branding_icon TEXT DEFAULT NULL
 );
 CREATE TABLE email_setting(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,6 +87,8 @@ CREATE TABLE oauth_credential(
   client_secret VARCHAR(64) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
   updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  config_url VARCHAR(256),
+  config_scopes VARCHAR(256),
   CONSTRAINT `idx_provider` UNIQUE(`provider`)
 );
 CREATE TABLE user_completions(
@@ -153,6 +159,7 @@ CREATE TABLE provided_repositories(
   active BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
   updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  refs TEXT,
   FOREIGN KEY(integration_id) REFERENCES integrations(id) ON DELETE CASCADE,
   CONSTRAINT idx_unique_integration_id_vendor_id UNIQUE(integration_id, vendor_id)
 );
@@ -175,13 +182,10 @@ CREATE TABLE thread_messages(
   role TEXT NOT NULL,
   content TEXT NOT NULL,
   -- Array of code attachments, in format of `ThreadMessageAttachmentCode`
-  code_attachments BLOB,
-  -- Array of client code attachments, in format of `ThreadMessageAttachmentClientCode`
-  client_code_attachments BLOB,
-  -- Array of doc attachments, in format of `ThreadMessageAttachmentDoc`
-  doc_attachments BLOB,
   created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
   updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  code_source_id VARCHAR(255),
+  attachment BLOB NOT NULL DEFAULT '{}',
   FOREIGN KEY(thread_id) REFERENCES threads(id) ON DELETE CASCADE
 );
 CREATE TABLE web_documents(
@@ -222,4 +226,81 @@ updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
 FOREIGN KEY(user_group_id) REFERENCES user_groups(id) ON DELETE CASCADE,
 -- access_policy is unique per source_id and user_group_id
   CONSTRAINT idx_unique_source_id_user_group_id UNIQUE(source_id, user_group_id)
+);
+CREATE TABLE notifications(
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  -- enum of admin, all_user
+  recipient VARCHAR(255) NOT NULL DEFAULT 'admin',
+  -- content of notification, in markdown format.
+  content TEXT NOT NULL
+);
+CREATE TABLE read_notifications(
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  notification_id INTEGER NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  CONSTRAINT idx_unique_user_id_notification_id UNIQUE(user_id, notification_id),
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY(notification_id) REFERENCES notifications(id) ON DELETE CASCADE
+);
+CREATE TABLE ldap_credential(
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  host STRING NOT NULL,
+  port INTEGER NOT NULL DEFAULT 389,
+  bind_dn STRING NOT NULL,
+  bind_password STRING NOT NULL,
+  base_dn STRING NOT NULL,
+  user_filter STRING NOT NULL,
+  -- enum of none, starttls, ldaps
+  encryption STRING NOT NULL DEFAULT 'none',
+  skip_tls_verify BOOLEAN NOT NULL DEFAULT FALSE,
+  --- the attribute to be used as the Tabby user email address
+  email_attribute STRING NOT NULL DEFAULT 'email',
+  --- the attribute to be used as the Tabby user name
+  name_attribute STRING,
+  created_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now')),
+  updated_at TIMESTAMP NOT NULL DEFAULT(DATETIME('now'))
+);
+CREATE TABLE IF NOT EXISTS "pages"(
+  id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+  author_id integer NOT NULL,
+  title text,
+  content text,
+  created_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  updated_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  code_source_id VARCHAR(255),
+  FOREIGN KEY(author_id) REFERENCES "users"(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS "page_sections"(
+  id integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+  page_id integer NOT NULL,
+  title text NOT NULL,
+  content text,
+  "position" integer NOT NULL,
+  created_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  updated_at timestamp NOT NULL DEFAULT(DATETIME('now')),
+  attachment BLOB NOT NULL DEFAULT '{}',
+  FOREIGN KEY(page_id) REFERENCES "pages"(id) ON DELETE CASCADE,
+  UNIQUE(page_id, "position")
+);
+CREATE TABLE ingested_documents(
+  id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+  -- User-provided document source
+  source TEXT NOT NULL,
+  -- User-provided document ID, unique within the same source
+  doc_id TEXT NOT NULL,
+  link TEXT,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  -- Track progress of ingestion
+  status TEXT NOT NULL CHECK(status IN('pending', 'indexed', 'failed')),
+  -- Expiration time in Unix timestamp(0 means never expired, should be cleaned by API)
+  expired_at INTEGER NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- Enforce unique constraint on(source, doc_id) to ensure document IDs are unique within the same source
+  UNIQUE(source, doc_id)
 );

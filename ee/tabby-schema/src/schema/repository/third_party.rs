@@ -25,7 +25,7 @@ pub struct ProvidedRepository {
 
 impl ProvidedRepository {
     pub fn format_source_id(id: &ID) -> String {
-        format!("provided_repository:{}", id)
+        format!("provided_repository:{id}")
     }
 }
 
@@ -105,9 +105,15 @@ pub trait ThirdPartyRepositoryService: Send + Sync + RepositoryProvider {
         last: Option<usize>,
     ) -> Result<Vec<ProvidedRepository>>;
 
-    async fn get_provided_repository(&self, id: ID) -> Result<ProvidedRepository>;
+    async fn get_provided_repository(&self, id: &ID) -> Result<ProvidedRepository>;
 
-    async fn update_repository_active(&self, id: ID, active: bool) -> Result<()>;
+    async fn update_repository_active(
+        &self,
+        id: ID,
+        active: bool,
+        refs: Option<Vec<String>>,
+    ) -> Result<()>;
+    async fn update_repository_refs(&self, id: ID, refs: Vec<String>) -> Result<()>;
     async fn upsert_repository(
         &self,
         integration_id: ID,

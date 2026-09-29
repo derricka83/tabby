@@ -97,7 +97,11 @@ impl GitlabClient {
 
 #[async_trait]
 impl OAuthClient for GitlabClient {
-    async fn exchange_code_for_token(&self, code: String) -> Result<String> {
+    async fn exchange_code_for_token(
+        &self,
+        code: String,
+        _state: Option<String>,
+    ) -> Result<String> {
         let credentials = self.read_credential().await?;
         let redirect_uri = self.auth.oauth_callback_url(OAuthProvider::Gitlab).await?;
         let token_resp = self
@@ -128,7 +132,7 @@ impl OAuthClient for GitlabClient {
             .header(reqwest::header::ACCEPT, "application/vnd.gitlab+json")
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", access_token),
+                format!("Bearer {access_token}"),
             )
             .send()
             .await?;
@@ -148,7 +152,7 @@ impl OAuthClient for GitlabClient {
             .header(reqwest::header::ACCEPT, "application/vnd.gitlab+json")
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", access_token),
+                format!("Bearer {access_token}"),
             )
             .send()
             .await?;

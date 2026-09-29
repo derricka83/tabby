@@ -1,181 +1,83 @@
-import { ChatEditCommand } from "tabby-agent";
+import type { Location } from "vscode-languageclient";
+import { window, TextEditor, Selection, Position, CancellationToken, Range } from "vscode";
+import { Client } from "../lsp/client";
 import { Config } from "../Config";
-import {
-  CancellationTokenSource,
-  QuickPickItem,
-  ThemeIcon,
-  QuickPickItemKind,
-  window,
-  TextEditor,
-  Selection,
-  Position,
-  QuickPick,
-  QuickPickItemButtonEvent,
-} from "vscode";
-import { Client } from "../lsp/Client";
 import { ContextVariables } from "../ContextVariables";
+import { getLogger } from "../logger";
+import { InlineEditCommand, UserCommandQuickpick } from "./quickPick";
 
 export class InlineEditController {
-  private chatEditCancellationTokenSource: CancellationTokenSource | null = null;
-  private quickPick: QuickPick<EditCommand>;
-
-  private recentlyCommand: string[] = [];
-  private suggestedCommand: ChatEditCommand[] = [];
+  private readonly logger = getLogger("InlineEditController");
+  private readonly editLocation: Location;
 
   constructor(
     private client: Client,
     private config: Config,
     private contextVariables: ContextVariables,
     private editor: TextEditor,
-    private editLocation: EditLocation,
-    private userCommand?: string,
+    private range: Range,
   ) {
-    this.recentlyCommand = this.config.chatEditRecentlyCommand.slice(0, this.config.maxChatEditHistory);
+    this.editLocation = {
+      uri: this.editor.document.uri.toString(),
+      range: {
+        start: { line: this.range.start.line, character: 0 },
+        end: {
+          line: this.range.end.character === 0 ? this.range.end.line : this.range.end.line + 1,
+          character: 0,
+        },
+      },
+    };
+  }
 
-    const fetchingSuggestedCommandCancellationTokenSource = new CancellationTokenSource();
-    this.client.chat.provideEditCommands(
-      { location: editLocation },
-      { commands: this.suggestedCommand, callback: () => this.updateQuickPickList() },
-      fetchingSuggestedCommandCancellationTokenSource.token,
-    );
+  async start(userCommand: string | undefined, cancellationToken: CancellationToken) {
+    const inlineEditCommand: InlineEditCommand | undefined = userCommand
+      ? { command: userCommand }
+      : await this.showQuickPick();
+    if (inlineEditCommand?.command) {
+      await this.provideEditWithCommand(inlineEditCommand, cancellationToken);
+    }
+  }
 
-    const quickPick = window.createQuickPick<EditCommand>();
-    quickPick.placeholder = "Enter the command for editing";
-    quickPick.matchOnDescription = true;
-    quickPick.onDidChangeValue(() => this.updateQuickPickList());
-    quickPick.onDidHide(() => {
-      fetchingSuggestedCommandCancellationTokenSource.cancel();
+  private async showQuickPick(): Promise<InlineEditCommand | undefined> {
+    const quickPick = new UserCommandQuickpick(this.client, this.config, this.editLocation);
+    return await quickPick.start();
+  }
+
+  private async provideEditWithCommand(command: InlineEditCommand, cancellationToken: CancellationToken) {
+    // Lock the cursor (editor selection) at start position, it will be unlocked after the edit is done
+    const startPosition = new Position(this.range.start.line, 0);
+    const resetEditorSelection = () => {
+      this.editor.selection = new Selection(startPosition, startPosition);
+    };
+    const selectionListenerDisposable = window.onDidChangeTextEditorSelection((event) => {
+      if (event.textEditor === this.editor) {
+        resetEditorSelection();
+      }
     });
-    quickPick.onDidAccept(this.onDidAccept, this);
-    quickPick.onDidTriggerItemButton(this.onDidTriggerItemButton, this);
+    resetEditorSelection();
 
-    this.quickPick = quickPick;
-  }
-
-  async start() {
-    this.userCommand ? await this.provideEditWithCommand(this.userCommand) : this.quickPick.show();
-  }
-
-  private async onDidAccept() {
-    const command = this.quickPick.selectedItems[0]?.value;
-    this.quickPick.hide();
-    if (!command) {
-      return;
-    }
-    if (command && command.length > 200) {
-      window.showErrorMessage("Command is too long.");
-      return;
-    }
-    await this.provideEditWithCommand(command);
-  }
-
-  private async provideEditWithCommand(command: string) {
-    const startPosition = new Position(this.editLocation.range.start.line, this.editLocation.range.start.character);
-
-    if (!this.userCommand) {
-      const updatedRecentlyCommand = [command]
-        .concat(this.recentlyCommand.filter((item) => item !== command))
-        .slice(0, this.config.maxChatEditHistory);
-      this.config.chatEditRecentlyCommand = updatedRecentlyCommand;
-    }
-
-    this.editor.selection = new Selection(startPosition, startPosition);
     this.contextVariables.chatEditInProgress = true;
-    this.chatEditCancellationTokenSource = new CancellationTokenSource();
+    this.logger.log(`Provide edit with command: ${JSON.stringify(command)}`);
     try {
       await this.client.chat.provideEdit(
         {
           location: this.editLocation,
-          command,
+          command: command.command,
+          context: command.context,
           format: "previewChanges",
         },
-        this.chatEditCancellationTokenSource.token,
+        cancellationToken,
       );
     } catch (error) {
       if (typeof error === "object" && error && "message" in error && typeof error["message"] === "string") {
-        window.showErrorMessage(error["message"]);
+        if (cancellationToken.isCancellationRequested || error["message"].includes("This operation was aborted")) {
+          // user canceled
+        } else {
+          window.showErrorMessage(error["message"]);
+        }
       }
     }
-    this.chatEditCancellationTokenSource.dispose();
-    this.chatEditCancellationTokenSource = null;
+    selectionListenerDisposable.dispose();
     this.contextVariables.chatEditInProgress = false;
-    this.editor.selection = new Selection(startPosition, startPosition);
   }
-
-  private onDidTriggerItemButton(event: QuickPickItemButtonEvent<EditCommand>) {
-    const item = event.item;
-    const button = event.button;
-    if (button.iconPath instanceof ThemeIcon && button.iconPath.id === "settings-remove") {
-      const index = this.recentlyCommand.indexOf(item.value);
-      if (index !== -1) {
-        this.recentlyCommand.splice(index, 1);
-        this.config.chatEditRecentlyCommand = this.recentlyCommand;
-        this.updateQuickPickList();
-      }
-    }
-
-    if (button.iconPath instanceof ThemeIcon && button.iconPath.id === "edit") {
-      this.quickPick.value = item.value;
-    }
-  }
-
-  private updateQuickPickList() {
-    const input = this.quickPick.value;
-    const list: (QuickPickItem & { value: string })[] = [];
-    list.push(
-      ...this.suggestedCommand.map((item) => ({
-        label: item.label,
-        value: item.command,
-        iconPath: item.source === "preset" ? new ThemeIcon("run") : new ThemeIcon("spark"),
-        description: item.source === "preset" ? item.command : "Suggested",
-      })),
-    );
-    if (list.length > 0) {
-      list.push({
-        label: "",
-        value: "",
-        kind: QuickPickItemKind.Separator,
-        alwaysShow: true,
-      });
-    }
-    const recentlyCommandToAdd = this.recentlyCommand.filter((item) => !list.find((i) => i.value === item));
-    list.push(
-      ...recentlyCommandToAdd.map((item) => ({
-        label: item,
-        value: item,
-        iconPath: new ThemeIcon("history"),
-        description: "History",
-        buttons: [
-          {
-            iconPath: new ThemeIcon("edit"),
-          },
-          {
-            iconPath: new ThemeIcon("settings-remove"),
-          },
-        ],
-      })),
-    );
-    if (input.length > 0 && !list.find((i) => i.value === input)) {
-      list.unshift({
-        label: input,
-        value: input,
-        iconPath: new ThemeIcon("run"),
-        description: "",
-        alwaysShow: true,
-      });
-    }
-    this.quickPick.items = list;
-  }
-}
-
-interface EditCommand extends QuickPickItem {
-  value: string;
-}
-
-interface EditLocation {
-  uri: string;
-  range: {
-    start: { line: number; character: number };
-    end: { line: number; character: number };
-  };
 }

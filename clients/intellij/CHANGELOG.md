@@ -1,3 +1,98 @@
+## 1.13.0
+
+### Features
+
+- **Chat**:
+  - Requires Tabby Server 0.27.0 or later.
+  - You can now select code in the editor and use the `Code Review` option from the context menu to review your code and add comments using Tabby Chat.
+
+## 1.12.0
+
+### Features
+
+- **Chat**:
+  - Requires connecting to a Tabby server version 0.26.0 or later.
+  - Added support to view recent chat history in the chat panel.
+- Added an action `Generate Commit Message` in the `Git` menu to generate a commit message based on the current changes.
+
+## 1.11.0
+
+### Features
+
+- **Chat**:
+  - Requires connecting to a Tabby server version 0.25.0 or later.
+  - Now uses the active editor as context by default.
+
+### Fixes & Improvements
+
+- Optimized the display of file paths in the chat panel.
+
+## 1.10.1
+
+### Fixes & Improvements
+
+- Reduced the use of read locks to prevent UI freezing issues when collecting declaration code snippets for code completion.
+
+## 1.10.0
+
+### Features
+
+- **Chat**:
+  - Added support to explicitly select a configured Git repository as the context for chat conversations.
+  - Added support to use the active editor selection as the context for chat conversations.
+  - **Note**: Requires updating the Tabby server to version 0.23.0 or later.
+
+## 1.9.1
+
+### Fixes & Improvements
+
+- Updated the chat panel to be compatible with Tabby server versions 0.21.2, 0.22.0, and later.
+
+## 1.9.0
+
+### Features
+
+- Added a list of actions in the editor's right-click context menu to interact with the Tabby chat panel.
+
+### Fixes & Improvements
+
+- Added support for collecting declaration code snippets to improve the code completion context.
+- Fixed the "Test Connection" button in the settings page to wait for the response correctly.
+- Fixed the bug where changing the completion trigger mode did not take effect immediately.
+- Fixed the chat panel theme syncing issue when switching between light and dark themes.
+- Added a help message when failing to create the chat panel.
+
+## 1.8.6
+
+### Fixes & Improvements
+
+- Fixed unhandled exception for requests when the completion API is not available on the server.
+- Added support for the latest IntelliJ Platform IDE versions.
+
+## 1.8.4
+
+### Fixes & Improvements
+
+- Fixed an issue where the chat panel failed to display when the endpoint configuration ended with a trailing slash.
+
+## 1.8.3
+
+### Fixes & Improvements
+
+- Fixed a bug that caused the Tabby plugin to not initialize when TLS certificates failed to load. (https://github.com/TabbyML/tabby/issues/3248)
+
+## 1.8.2
+
+### Fixes & Improvements
+
+- Fix DataStore initialization that prevented Tabby from starting on a fresh installation. (https://github.com/TabbyML/tabby/issues/3234)
+
+## 1.8.1
+
+### Features
+
+- Updated the chat panel to compatible with Tabby server v0.18.0 or later.
+
 ## 1.7.1
 
 ### Features

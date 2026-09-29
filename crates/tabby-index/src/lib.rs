@@ -5,9 +5,15 @@ mod code;
 mod indexer;
 mod tantivy_utils;
 
+#[cfg(test)]
+mod testutils;
+
 use indexer::{IndexAttributeBuilder, Indexer};
 
-mod doc;
+mod structured_doc;
+
+#[cfg(test)]
+mod indexer_tests;
 
 pub mod public {
     use indexer::IndexGarbageCollector;
@@ -15,7 +21,12 @@ pub mod public {
     use super::*;
     pub use super::{
         code::CodeIndexer,
-        doc::public::{DocIndexer, WebDocument},
+        structured_doc::public::{
+            StructuredDoc, StructuredDocCommitFields, StructuredDocFields,
+            StructuredDocGarbageCollector, StructuredDocIndexer, StructuredDocIngestedFields,
+            StructuredDocIssueFields, StructuredDocPageFields, StructuredDocPullDocumentFields,
+            StructuredDocState, StructuredDocWebFields, KIND_COMMIT as STRUCTURED_DOC_KIND_COMMIT,
+        },
     };
 
     pub fn run_index_garbage_collection(active_sources: Vec<String>) -> anyhow::Result<()> {

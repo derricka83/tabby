@@ -1,150 +1,219 @@
+mod prompt_tools;
+
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use async_openai::{
-    error::OpenAIError,
-    types::{
-        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
-        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, Role,
-    },
-};
+use async_openai_alt::{error::OpenAIError, types::CreateChatCompletionRequestArgs};
 use async_stream::stream;
 use futures::stream::BoxStream;
+use prompt_tools::{pipeline_decide_need_codebase_context, pipeline_related_questions};
 use tabby_common::{
     api::{
-        code::{CodeSearch, CodeSearchError, CodeSearchHit, CodeSearchParams, CodeSearchQuery},
-        doc::{DocSearch, DocSearchError, DocSearchHit},
+        event::{Event, EventLogger},
+        structured_doc::DocSearchDocument,
     },
     config::AnswerConfig,
 };
 use tabby_inference::ChatCompletionStream;
 use tabby_schema::{
-    context::{ContextInfoHelper, ContextService},
-    policy::AccessPolicy,
+    auth::{AuthenticationService, UserSecured},
+    context::ContextService,
     thread::{
-        self, CodeQueryInput, CodeSearchParamsOverrideInput, DocQueryInput, MessageAttachment,
-        ThreadAssistantMessageAttachmentsCode, ThreadAssistantMessageAttachmentsDoc,
-        ThreadAssistantMessageContentDelta, ThreadRelevantQuestions, ThreadRunItem,
+        self, MessageAttachment, MessageAttachmentCodeFileList, MessageAttachmentDoc,
+        MessageDocSearchHit, ThreadAssistantMessageAttachmentsCode,
+        ThreadAssistantMessageAttachmentsCodeFileList, ThreadAssistantMessageAttachmentsDoc,
+        ThreadAssistantMessageCompletedDebugData, ThreadAssistantMessageContentDelta,
+        ThreadAssistantMessageReadingDoc, ThreadRelevantQuestions, ThreadRunItem,
         ThreadRunOptionsInput,
     },
 };
 use tracing::{debug, error, warn};
 
-use crate::bail;
-
+use crate::service::{
+    retrieval::RetrievalService,
+    utils::{
+        convert_messages_to_chat_completion_request,
+        convert_user_message_to_chat_completion_request,
+    },
+};
 pub struct AnswerService {
+    logger: Arc<dyn EventLogger>,
     config: AnswerConfig,
+    auth: Arc<dyn AuthenticationService>,
     chat: Arc<dyn ChatCompletionStream>,
-    code: Arc<dyn CodeSearch>,
-    doc: Arc<dyn DocSearch>,
+    retrieval: Arc<RetrievalService>,
     context: Arc<dyn ContextService>,
-    serper: Option<Box<dyn DocSearch>>,
 }
 
 impl AnswerService {
     fn new(
+        logger: Arc<dyn EventLogger>,
         config: &AnswerConfig,
+        auth: Arc<dyn AuthenticationService>,
         chat: Arc<dyn ChatCompletionStream>,
-        code: Arc<dyn CodeSearch>,
-        doc: Arc<dyn DocSearch>,
+        retrieval: Arc<RetrievalService>,
         context: Arc<dyn ContextService>,
-        serper: Option<Box<dyn DocSearch>>,
     ) -> Self {
         Self {
+            logger,
             config: config.clone(),
+            auth,
             chat,
-            code,
-            doc,
+            retrieval,
             context,
-            serper,
         }
     }
 
-    pub async fn answer_v2<'a>(
+    pub async fn answer<'a>(
         self: Arc<Self>,
-        policy: &AccessPolicy,
+        user: &UserSecured,
         messages: &[tabby_schema::thread::Message],
         options: &ThreadRunOptionsInput,
         user_attachment_input: Option<&tabby_schema::thread::MessageAttachmentInput>,
     ) -> tabby_schema::Result<BoxStream<'a, tabby_schema::Result<ThreadRunItem>>> {
-        let messages = messages.to_vec();
+        let (last_message, messages) = match messages.split_last() {
+            Some((last_message, messages)) => (last_message.clone(), messages.to_vec()),
+            None => {
+                return Err(anyhow!("No message found in the request").into());
+            }
+        };
+
         let options = options.clone();
         let user_attachment_input = user_attachment_input.cloned();
-        let policy = policy.clone();
+        let policy = user.policy.clone();
+        let logger = self.logger.clone();
 
         let s = stream! {
             let context_info = self.context.read(Some(&policy)).await?;
             let context_info_helper = context_info.helper();
 
-            let query = match messages.last() {
-                Some(query) => query,
-                None => {
-                    yield Err(anyhow!("No query found in the request").into());
-                    return;
-                }
-            };
-
             let mut attachment = MessageAttachment::default();
 
             // 1. Collect relevant code if needed.
             if let Some(code_query) = options.code_query.as_ref() {
-                let hits = self.collect_relevant_code(
-                    &context_info_helper,
-                    code_query,
-                    &self.config.code_search_params,
-                    options.debug_options.as_ref().and_then(|x| x.code_search_params_override.as_ref())
-                ).await;
-                attachment.code = hits.iter().map(|x| x.doc.clone().into()).collect::<Vec<_>>();
+                if let Some(repository) = self.retrieval.find_repository(&context_info_helper, &policy, code_query).await {
+                    let need_codebase_context = pipeline_decide_need_codebase_context(self.chat.clone(), &last_message.content).await?;
+                    yield Ok(ThreadRunItem::ThreadAssistantMessageReadingCode(need_codebase_context.clone()));
+                    if need_codebase_context.file_list {
+                        // List at most 300 files in the repository.
+                        match self.retrieval.collect_file_list(&policy, &repository, None, Some(300)).await {
+                            Ok((file_list, truncated)) => {
+                                attachment.code_file_list = Some(MessageAttachmentCodeFileList {
+                                    file_list: file_list.clone(),
+                                    truncated,
+                                });
+                                yield Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsCodeFileList(ThreadAssistantMessageAttachmentsCodeFileList {
+                                    file_list,
+                                    truncated
+                                }));
+                            }
+                            Err(e) => {
+                                error!("failed to list files for repository {}: {}", repository.id, e);
+                            }
+                        }
+                    }
 
-                if !hits.is_empty() {
-                    let hits = hits.into_iter().map(|x| x.into()).collect::<Vec<_>>();
-                    yield Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsCode(
-                        ThreadAssistantMessageAttachmentsCode { hits }
-                    ));
-                }
+                    if need_codebase_context.snippet {
+                        let hits = self.retrieval.collect_relevant_code(
+                            &repository,
+                            &context_info_helper,
+                            code_query,
+                            &self.config.code_search_params,
+                            options.debug_options.as_ref().and_then(|x| x.code_search_params_override.as_ref()),
+                        ).await;
+                        attachment.code = hits.iter().map(|x| x.doc.clone().into()).collect::<Vec<_>>();
+
+                        let hits = hits.into_iter().map(|x| x.into()).collect::<Vec<_>>();
+                        yield Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsCode(
+                            ThreadAssistantMessageAttachmentsCode { hits }
+                        ));
+                    }
+
+                };
             };
 
             // 2. Collect relevant docs if needed.
             if let Some(doc_query) = options.doc_query.as_ref() {
-                let hits = self.collect_relevant_docs(&context_info_helper, doc_query)
-                    .await;
-                attachment.doc = hits.iter()
-                        .map(|x| x.doc.clone().into())
-                        .collect::<Vec<_>>();
+                let mut sources = doc_query
+                    .source_ids
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_vec();
+                sources.retain(|x| context_info_helper.can_access_source_id(x));
 
-                if !attachment.doc.is_empty() {
-                    let hits = hits.into_iter().map(|x| x.into()).collect::<Vec<_>>();
-                    yield Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsDoc(
-                        ThreadAssistantMessageAttachmentsDoc { hits }
-                    ));
-                }
+                // Emit the ThreadAssistantMessageReadingDoc event to indicate the initiation
+                // of the document retrieval process.
+                // The sources are filtered to include only those that are accessible to the user.
+                yield Ok(ThreadRunItem::ThreadAssistantMessageReadingDoc(ThreadAssistantMessageReadingDoc {
+                    source_ids: sources,
+                }));
+
+                let hits = self.retrieval.collect_relevant_docs(&context_info_helper, doc_query)
+                    .await;
+                attachment.doc = futures::future::join_all(hits.iter().map(|x| async {
+                    Self::new_message_attachment_doc(self.auth.clone(), x.doc.clone()).await
+                })).await;
+
+                debug!("query content: {:?}, matched {:?} docs", doc_query.content, attachment.doc.len());
+
+                let hits = futures::future::join_all(hits.into_iter().map(|x| {
+                    let score = x.score;
+                    let doc = x.doc.clone();
+                    let auth = self.auth.clone();
+                    async move {
+                        MessageDocSearchHit {
+                            score: score as f64,
+                            doc: Self::new_message_attachment_doc(auth, doc).await,
+                        }
+                    }
+                })).await;
+                yield Ok(ThreadRunItem::ThreadAssistantMessageAttachmentsDoc(
+                    ThreadAssistantMessageAttachmentsDoc { hits }
+                ));
             };
 
             // 3. Generate relevant questions.
             if options.generate_relevant_questions {
                 // Rewrite [[source:${id}]] tags to the actual source name for generate relevant questions.
-                let content = context_info_helper.rewrite_tag(&query.content);
-                let questions = self
-                    .generate_relevant_questions_v2(&attachment, &content)
-                    .await;
-                yield Ok(ThreadRunItem::ThreadRelevantQuestions(ThreadRelevantQuestions{
-                    questions
-                }));
+                let content = context_info_helper.rewrite_tag(&last_message.content);
+                match self
+                    .generate_relevant_questions(&attachment, &content)
+                    .await{
+                    Ok(questions) => {
+                        yield Ok(ThreadRunItem::ThreadRelevantQuestions(ThreadRelevantQuestions{
+                            questions
+                        }));
+                    }
+                    Err(err) => {
+                        warn!("Failed to generate relevant questions: {}", err);
+                    }
+                }
             }
 
             // 4. Prepare requesting LLM
             let request = {
-                let chat_messages = convert_messages_to_chat_completion_request(&self.config, &context_info_helper, &messages, &attachment, user_attachment_input.as_ref())?;
+                let mut chat_messages = convert_messages_to_chat_completion_request(
+                    Some(&self.config.system_prompt),
+                    &context_info_helper,
+                    &messages,
+                )?;
+                let user_message = convert_user_message_to_chat_completion_request(
+                    &context_info_helper,
+                    &last_message.content,
+                    &attachment,
+                    user_attachment_input.as_ref(),
+                );
+                chat_messages.push(user_message);
 
                 CreateChatCompletionRequestArgs::default()
                     .messages(chat_messages)
+                    .model(options.model_name.as_deref().unwrap_or(""))
                     .presence_penalty(self.config.presence_penalty)
                     .build()
                     .expect("Failed to build chat completion request")
             };
 
-
-            let s = match self.chat.chat_stream(request).await {
+            let s = match self.chat.chat_stream(request.clone()).await {
                 Ok(s) => s,
                 Err(err) => {
                     warn!("Failed to create chat completion stream: {:?}", err);
@@ -156,130 +225,71 @@ impl AnswerService {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(err) => {
-                        if let OpenAIError::StreamError(content) = err {
+                        if let OpenAIError::StreamError(content) = &err {
                             if content == "Stream ended" {
                                 break;
                             }
-                        } else {
-                            error!("Failed to get chat completion chunk: {:?}", err);
                         }
-                        break;
+                        error!("Failed to get chat completion chunk: {:?}", err);
+                        yield Err(anyhow!("Failed to get chat completion chunk: {:?}", err).into());
+                        return;
                     }
                 };
 
-                if let Some(content) = chunk.choices[0].delta.content.as_deref() {
+                let content = chunk.choices.first().and_then(|x| x.delta.content.as_deref());
+                if let Some(content) = content {
                     yield Ok(ThreadRunItem::ThreadAssistantMessageContentDelta(ThreadAssistantMessageContentDelta {
                         delta: content.to_owned()
                     }));
                 }
             }
+
+            let debug_data = if options.debug_options.map(|x| x.return_chat_completion_request).unwrap_or_default() {
+                Some(ThreadAssistantMessageCompletedDebugData {
+                    chat_completion_messages: request.messages.into_iter().map(|x| x.into()).collect(),
+                })
+            } else {
+                None
+            };
+
+            yield Ok(ThreadRunItem::ThreadAssistantMessageCompleted(
+                thread::ThreadAssistantMessageCompleted {
+                    debug_data,
+                },
+            ));
         };
+
+        logger.log(Some(user.id.to_string()), Event::ChatCompletion {});
 
         Ok(Box::pin(s))
     }
 
-    async fn collect_relevant_code(
-        &self,
-        helper: &ContextInfoHelper,
-        input: &CodeQueryInput,
-        params: &CodeSearchParams,
-        override_params: Option<&CodeSearchParamsOverrideInput>,
-    ) -> Vec<CodeSearchHit> {
-        let source_id: Option<&str> = {
-            if let Some(source_id) = &input.source_id {
-                // If source_id doesn't exist, return empty result.
-                if helper.can_access_source_id(source_id) {
-                    Some(source_id.as_str())
-                } else {
-                    None
-                }
-            } else if let Some(git_url) = &input.git_url {
-                helper.allowed_code_repository().closest_match(git_url)
-            } else {
-                None
-            }
+    async fn new_message_attachment_doc(
+        auth: Arc<dyn AuthenticationService>,
+        doc: DocSearchDocument,
+    ) -> MessageAttachmentDoc {
+        let author = match &doc {
+            DocSearchDocument::Issue(issue) => issue.author_email.as_deref(),
+            DocSearchDocument::Pull(pull) => pull.author_email.as_deref(),
+            DocSearchDocument::Commit(commit) => Some(commit.author_email.as_str()),
+            _ => None,
+        };
+        let user = if let Some(email) = author {
+            auth.get_user_by_email(email).await.ok().map(|x| x.into())
+        } else {
+            None
         };
 
-        let Some(source_id) = source_id else {
-            return vec![];
-        };
-
-        let query = CodeSearchQuery::new(
-            input.filepath.clone(),
-            input.language.clone(),
-            helper.rewrite_tag(&input.content),
-            source_id.to_owned(),
-        );
-
-        let mut params = params.clone();
-        override_params
-            .as_ref()
-            .inspect(|x| x.override_params(&mut params));
-
-        match self.code.search_in_language(query, params).await {
-            Ok(docs) => docs.hits,
-            Err(err) => {
-                if let CodeSearchError::NotReady = err {
-                    debug!("Code search is not ready yet");
-                } else {
-                    warn!("Failed to search code: {:?}", err);
-                }
-                vec![]
-            }
-        }
+        MessageAttachmentDoc::from_doc_search_document(doc, user)
     }
 
-    async fn collect_relevant_docs(
-        &self,
-        helper: &ContextInfoHelper,
-        doc_query: &DocQueryInput,
-    ) -> Vec<DocSearchHit> {
-        let mut source_ids = doc_query.source_ids.as_deref().unwrap_or_default().to_vec();
-
-        // Only keep source_ids that are valid.
-        source_ids.retain(|x| helper.can_access_source_id(x));
-
-        // Rewrite [[source:${id}]] tags to the actual source name for doc search.
-        let content = helper.rewrite_tag(&doc_query.content);
-
-        let mut hits = vec![];
-
-        // 1. Collect relevant docs from the tantivy doc search.
-        if !source_ids.is_empty() {
-            match self.doc.search(&source_ids, &content, 5).await {
-                Ok(docs) => hits.extend(docs.hits),
-                Err(err) => {
-                    if let DocSearchError::NotReady = err {
-                        debug!("Doc search is not ready yet");
-                    } else {
-                        warn!("Failed to search doc: {:?}", err);
-                    }
-                }
-            };
-        }
-
-        // 2. If serper is available, we also collect from serper
-        if doc_query.search_public {
-            if let Some(serper) = self.serper.as_ref() {
-                match serper.search(&[], &content, 5).await {
-                    Ok(docs) => hits.extend(docs.hits),
-                    Err(err) => {
-                        warn!("Failed to search serper: {:?}", err);
-                    }
-                };
-            }
-        }
-
-        hits
-    }
-
-    async fn generate_relevant_questions_v2(
+    async fn generate_relevant_questions(
         &self,
         attachment: &MessageAttachment,
         question: &str,
-    ) -> Vec<String> {
+    ) -> anyhow::Result<Vec<String>> {
         if attachment.code.is_empty() && attachment.doc.is_empty() {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let snippets: Vec<String> = attachment
@@ -295,199 +305,24 @@ impl AnswerService {
                 attachment
                     .doc
                     .iter()
-                    .map(|doc| format!("```\n{}\n```", doc.content)),
+                    .map(|doc| format!("```\n{}\n```", doc.content())),
             )
             .collect();
 
         let context: String = snippets.join("\n\n");
-        let prompt = format!(
-            r#"
-You are a helpful assistant that helps the user to ask related questions, based on user's original question and the related contexts. Please identify worthwhile topics that can be follow-ups, and write questions no longer than 20 words each. Please make sure that specifics, like events, names, locations, are included in follow up questions so they can be asked standalone. For example, if the original question asks about "the Manhattan project", in the follow up question, do not just say "the project", but use the full name "the Manhattan project". Your related questions must be in the same language as the original question.
-
-Here are the contexts of the question:
-
-{context}
-
-Remember, based on the original question and related contexts, suggest three such further questions. Do NOT repeat the original question. Each related question should be no longer than 20 words. Here is the original question:
-
-{question}
-"#
-        );
-
-        let request = CreateChatCompletionRequestArgs::default()
-            .messages(vec![ChatCompletionRequestMessage::User(
-                ChatCompletionRequestUserMessageArgs::default()
-                    .content(prompt)
-                    .build()
-                    .expect("Failed to create ChatCompletionRequestUserMessage"),
-            )])
-            .build()
-            .expect("Failed to create ChatCompletionRequest");
-
-        let chat = self.chat.clone();
-        let s = chat
-            .chat(request)
-            .await
-            .expect("Failed to create chat completion stream");
-        let content = s.choices[0]
-            .message
-            .content
-            .as_deref()
-            .expect("Failed to get content from chat completion");
-        content
-            .lines()
-            .map(trim_bullet)
-            .filter(|x| !x.is_empty())
-            .collect()
+        pipeline_related_questions(self.chat.clone(), &context, question).await
     }
-}
-
-fn trim_bullet(s: &str) -> String {
-    let is_bullet = |c: char| c == '-' || c == '*' || c == '.' || c.is_numeric();
-    s.trim()
-        .trim_start_matches(is_bullet)
-        .trim_end_matches(is_bullet)
-        .trim()
-        .to_owned()
 }
 
 pub fn create(
+    logger: Arc<dyn EventLogger>,
     config: &AnswerConfig,
+    auth: Arc<dyn AuthenticationService>,
     chat: Arc<dyn ChatCompletionStream>,
-    code: Arc<dyn CodeSearch>,
-    doc: Arc<dyn DocSearch>,
+    retrieval: Arc<RetrievalService>,
     context: Arc<dyn ContextService>,
-    serper: Option<Box<dyn DocSearch>>,
 ) -> AnswerService {
-    AnswerService::new(config, chat, code, doc, context, serper)
-}
-
-fn convert_messages_to_chat_completion_request(
-    config: &AnswerConfig,
-    helper: &ContextInfoHelper,
-    messages: &[tabby_schema::thread::Message],
-    attachment: &tabby_schema::thread::MessageAttachment,
-    user_attachment_input: Option<&tabby_schema::thread::MessageAttachmentInput>,
-) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
-    let mut output = vec![];
-    output.reserve(messages.len() + 1);
-
-    // System message
-    output.push(ChatCompletionRequestMessage::System(
-        ChatCompletionRequestSystemMessage {
-            content: config.system_prompt.clone(),
-            role: Role::System,
-            name: None,
-        },
-    ));
-
-    for i in 0..messages.len() - 1 {
-        let x = &messages[i];
-        let role = match x.role {
-            thread::Role::Assistant => Role::Assistant,
-            thread::Role::User => Role::User,
-        };
-
-        let content = if role == Role::User {
-            if i % 2 != 0 {
-                bail!("User message must be followed by assistant message");
-            }
-
-            let y = &messages[i + 1];
-
-            build_user_prompt(&x.content, &y.attachment, None)
-        } else {
-            x.content.clone()
-        };
-
-        output.push(ChatCompletionRequestMessage::System(
-            ChatCompletionRequestSystemMessage {
-                content: helper.rewrite_tag(&content),
-                role,
-                name: None,
-            },
-        ));
-    }
-
-    output.push(ChatCompletionRequestMessage::System(
-        ChatCompletionRequestSystemMessage {
-            content: helper.rewrite_tag(&build_user_prompt(
-                &messages[messages.len() - 1].content,
-                attachment,
-                user_attachment_input,
-            )),
-            role: Role::User,
-            name: None,
-        },
-    ));
-
-    Ok(output)
-}
-
-fn build_user_prompt(
-    user_input: &str,
-    assistant_attachment: &tabby_schema::thread::MessageAttachment,
-    user_attachment_input: Option<&tabby_schema::thread::MessageAttachmentInput>,
-) -> String {
-    // If the user message has no code attachment and the assistant message has no code attachment or doc attachment, return the user message directly.
-    if user_attachment_input
-        .map(|x| x.code.is_empty())
-        .unwrap_or(true)
-        && assistant_attachment.code.is_empty()
-        && assistant_attachment.doc.is_empty()
-    {
-        return user_input.to_owned();
-    }
-
-    let snippets: Vec<String> = assistant_attachment
-        .doc
-        .iter()
-        .map(|doc| format!("```\n{}\n```", doc.content))
-        .chain(
-            user_attachment_input
-                .map(|x| &x.code)
-                .unwrap_or(&vec![])
-                .iter()
-                .map(|snippet| {
-                    if let Some(filepath) = &snippet.filepath {
-                        format!("```title=\"{}\"\n{}\n```", filepath, snippet.content)
-                    } else {
-                        format!("```\n{}\n```", snippet.content)
-                    }
-                }),
-        )
-        .chain(assistant_attachment.code.iter().map(|snippet| {
-            format!(
-                "```{} title=\"{}\"\n{}\n```",
-                snippet.language, snippet.filepath, snippet.content
-            )
-        }))
-        .collect();
-
-    let citations: Vec<String> = snippets
-        .iter()
-        .enumerate()
-        .map(|(i, snippet)| format!("[[citation:{}]]\n{}", i + 1, *snippet))
-        .collect();
-
-    let context = citations.join("\n\n");
-
-    format!(
-        r#"You are given a user question, and please write clean, concise and accurate answer to the question. You will be given a set of related contexts to the question, each starting with a reference number like [[citation:x]], where x is a number. Please use the context and cite the context at the end of each sentence if applicable.
-
-Your answer must be correct, accurate and written by an expert using an unbiased and professional tone. Please limit to 1024 tokens. Do not give any information that is not related to the question, and do not repeat. Say "information is missing on" followed by the related topic, if the given context do not provide sufficient information.
-
-Please cite the contexts with the reference numbers, in the format [[citation:x]]. If a sentence comes from multiple contexts, please list all applicable citations, like [[citation:3]][[citation:5]]. Other than code and specific names and citations, your answer must be written in the same language as the question.
-
-Here are the set of contexts:
-
-{context}
-
-Remember, don't blindly repeat the contexts verbatim. When possible, give code snippet to demonstrate the answer. And here is the user question:
-
-{user_input}
-"#
-    )
+    AnswerService::new(logger, config, auth, chat, retrieval, context)
 }
 
 #[cfg(test)]
@@ -495,33 +330,31 @@ pub mod testutils;
 
 #[cfg(test)]
 mod tests {
-
-    use std::{path::PathBuf, sync::Arc};
+    use std::sync::Arc;
 
     use juniper::ID;
-    use tabby_common::{
-        api::{
-            code::{CodeSearch, CodeSearchParams},
-            doc::DocSearch,
-        },
-        config::AnswerConfig,
-    };
-    use tabby_db::DbConn;
+    use tabby_common::api::{code::CodeSearch, structured_doc::DocSearch};
+    use tabby_db::{testutils::create_user, DbConn};
     use tabby_inference::ChatCompletionStream;
     use tabby_schema::{
-        context::{ContextInfo, ContextInfoHelper, ContextService, ContextSourceValue},
-        repository::{Repository, RepositoryKind},
+        context::{ContextInfo, ContextService, ContextSourceValue},
         thread::{CodeQueryInput, MessageAttachment},
         web_documents::PresetWebDocument,
         AsID,
     };
 
-    use crate::answer::{
+    use super::{
         testutils::{
-            FakeChatCompletionStream, FakeCodeSearch, FakeCodeSearchFail,
-            FakeCodeSearchFailNotReady, FakeContextService, FakeDocSearch,
+            make_answer_config, make_repository_service, FakeChatCompletionStream, FakeCodeSearch,
+            FakeContextService, FakeDocSearch,
         },
-        trim_bullet, AnswerService,
+        *,
+    };
+    use crate::{
+        event_logger::test_utils::MockEventLogger,
+        retrieval,
+        service::{auth, setting, UserSecuredExt},
+        utils::build_user_prompt,
     };
 
     const TEST_SOURCE_ID: &str = "source-1";
@@ -530,23 +363,6 @@ mod tests {
     const TEST_LANGUAGE: &str = "rust";
     const TEST_CONTENT: &str = "fn main() {}";
 
-    pub fn make_answer_config() -> AnswerConfig {
-        AnswerConfig {
-            code_search_params: make_code_search_params(),
-            presence_penalty: 0.1,
-            system_prompt: AnswerConfig::default_system_prompt(),
-        }
-    }
-
-    pub fn make_code_search_params() -> CodeSearchParams {
-        CodeSearchParams {
-            min_bm25_score: 0.5,
-            min_embedding_score: 0.7,
-            min_rrf_score: 0.3,
-            num_to_return: 5,
-            num_to_score: 10,
-        }
-    }
     pub fn make_code_query_input(source_id: Option<&str>, git_url: Option<&str>) -> CodeQueryInput {
         CodeQueryInput {
             filepath: Some(TEST_FILEPATH.to_string()),
@@ -555,20 +371,6 @@ mod tests {
             source_id: source_id.map(|id| id.to_string()),
             language: Some(TEST_LANGUAGE.to_string()),
         }
-    }
-
-    pub fn make_context_info_helper() -> ContextInfoHelper {
-        ContextInfoHelper::new(&ContextInfo {
-            sources: vec![ContextSourceValue::Repository(Repository {
-                id: ID::from(TEST_SOURCE_ID.to_owned()),
-                source_id: TEST_SOURCE_ID.to_owned(),
-                name: "tabby".to_owned(),
-                kind: RepositoryKind::Github,
-                dir: PathBuf::from("tabby"),
-                git_url: TEST_GIT_URL.to_owned(),
-                refs: vec![],
-            })],
-        })
     }
 
     pub fn make_message(
@@ -580,6 +382,7 @@ mod tests {
         tabby_schema::thread::Message {
             id: id.as_id(),
             thread_id: ID::new("0"),
+            code_source_id: None,
             content: content.to_owned(),
             role,
             attachment: attachment.unwrap_or_default(),
@@ -592,24 +395,25 @@ mod tests {
     fn test_build_user_prompt() {
         let user_input = "What is the purpose of this code?";
         let assistant_attachment = tabby_schema::thread::MessageAttachment {
-            doc: vec![tabby_schema::thread::MessageAttachmentDoc {
+            doc: vec![tabby_schema::thread::MessageAttachmentDoc::Web(tabby_schema::thread::MessageAttachmentWebDoc {
                 title: "Documentation".to_owned(),
                 content: "This code implements a basic web server.".to_owned(),
                 link: "https://example.com/docs".to_owned(),
-            }],
+            })],
             code: vec![tabby_schema::thread::MessageAttachmentCode {
                 git_url: "https://github.com/".to_owned(),
+                commit: Some("commit".to_owned()),
                 filepath: "server.py".to_owned(),
                 language: "python".to_owned(),
                 content: "from flask import Flask\n\napp = Flask(__name__)\n\n@app.route('/')\ndef hello():\n    return 'Hello, World!'".to_owned(),
-                start_line: 1,
+                start_line: Some(1),
             }],
             client_code: vec![],
+            code_file_list: None,
         };
         let user_attachment_input = None;
 
-        let prompt =
-            super::build_user_prompt(user_input, &assistant_attachment, user_attachment_input);
+        let prompt = build_user_prompt(user_input, &assistant_attachment, user_attachment_input);
 
         println!("{}", prompt.as_str());
         assert!(prompt.contains(user_input));
@@ -623,23 +427,30 @@ mod tests {
     fn test_convert_messages_to_chat_completion_request() {
         // Fake assistant attachment
         let attachment = tabby_schema::thread::MessageAttachment {
-            doc: vec![tabby_schema::thread::MessageAttachmentDoc {
-                title: "1. Example Document".to_owned(),
-                content: "This is an example".to_owned(),
-                link: "https://example.com".to_owned(),
-            }],
+            doc: vec![tabby_schema::thread::MessageAttachmentDoc::Web(
+                tabby_schema::thread::MessageAttachmentWebDoc {
+                    title: "1. Example Document".to_owned(),
+                    content: "This is an example".to_owned(),
+                    link: "https://example.com".to_owned(),
+                },
+            )],
             code: vec![tabby_schema::thread::MessageAttachmentCode {
                 git_url: "https://github.com".to_owned(),
+                commit: Some("commit".to_owned()),
                 filepath: "server.py".to_owned(),
                 language: "python".to_owned(),
                 content: "print('Hello, server!')".to_owned(),
-                start_line: 1,
+                start_line: Some(1),
             }],
             client_code: vec![tabby_schema::thread::MessageAttachmentClientCode {
                 filepath: Some("client.py".to_owned()),
                 content: "print('Hello, client!')".to_owned(),
                 start_line: Some(1),
             }],
+            code_file_list: Some(MessageAttachmentCodeFileList {
+                file_list: vec!["client.py".to_owned(), "server.py".to_owned()],
+                truncated: false,
+            }),
         };
 
         let messages = vec![
@@ -650,8 +461,8 @@ mod tests {
                 tabby_schema::thread::Role::Assistant,
                 Some(attachment),
             ),
-            make_message(3, "How are you?", tabby_schema::thread::Role::User, None),
         ];
+        let last_message = make_message(3, "How are you?", tabby_schema::thread::Role::User, None);
 
         let user_attachment_input = tabby_schema::thread::MessageAttachmentInput {
             code: vec![tabby_schema::thread::MessageAttachmentCodeInput {
@@ -674,145 +485,77 @@ mod tests {
         let rewriter = context_info.helper();
 
         let config = make_answer_config();
-        let output = super::convert_messages_to_chat_completion_request(
-            &config,
+        let mut output = super::convert_messages_to_chat_completion_request(
+            Some(&config.system_prompt),
             &rewriter,
             &messages,
-            &tabby_schema::thread::MessageAttachment::default(),
-            Some(&user_attachment_input),
         )
         .unwrap();
+        let user_message = convert_user_message_to_chat_completion_request(
+            &rewriter,
+            &last_message.content,
+            &tabby_schema::thread::MessageAttachment::default(),
+            Some(&user_attachment_input),
+        );
+        output.push(user_message);
 
         insta::assert_yaml_snapshot!(output);
     }
 
     #[tokio::test]
-    async fn test_collect_relevant_code() {
-        let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream);
-        let code: Arc<dyn CodeSearch> = Arc::new(FakeCodeSearch);
-        let doc: Arc<dyn DocSearch> = Arc::new(FakeDocSearch);
-        let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
-        let mut serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
-        let config = make_answer_config();
-        let mut service = AnswerService::new(
-            &config,
-            chat.clone(),
-            code.clone(),
-            doc.clone(),
-            context.clone(),
-            serper,
-        );
-        let code_query_input_could_access =
-            make_code_query_input(Some(TEST_SOURCE_ID), Some(TEST_GIT_URL));
-        let code_search_params = make_code_search_params();
-        let context_info_helper: ContextInfoHelper = make_context_info_helper();
-        debug_assert!(context_info_helper.can_access_source_id("source-1"));
-
-        service
-            .collect_relevant_code(
-                &context_info_helper,
-                &code_query_input_could_access,
-                &code_search_params,
-                None,
-            )
-            .await;
-
-        let code_query_input_not_access = make_code_query_input(Some("TEST"), Some(TEST_GIT_URL));
-        service
-            .collect_relevant_code(
-                &context_info_helper,
-                &code_query_input_not_access,
-                &code_search_params,
-                None,
-            )
-            .await;
-
-        let code_query_input_with_only_git = make_code_query_input(None, Some(TEST_GIT_URL));
-        service
-            .collect_relevant_code(
-                &context_info_helper,
-                &code_query_input_with_only_git,
-                &code_search_params,
-                None,
-            )
-            .await;
-
-        let code_query_input_with_only_git = make_code_query_input(None, None);
-        service
-            .collect_relevant_code(
-                &context_info_helper,
-                &code_query_input_with_only_git,
-                &code_search_params,
-                None,
-            )
-            .await;
-
-        let code_fail_not_ready = Arc::new(FakeCodeSearchFailNotReady);
-        serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
-
-        service = AnswerService::new(
-            &config,
-            chat.clone(),
-            code_fail_not_ready.clone(),
-            doc.clone(),
-            context.clone(),
-            serper,
-        );
-
-        let code_fail = Arc::new(FakeCodeSearchFail);
-        serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
-
-        service = AnswerService::new(
-            &config,
-            chat.clone(),
-            code_fail.clone(),
-            doc.clone(),
-            context.clone(),
-            serper,
-        )
-    }
-
-    #[tokio::test]
-    async fn test_generate_relevant_questions_v2() {
-        let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream);
+    async fn test_generate_relevant_questions() {
+        let auth = Arc::new(auth::testutils::FakeAuthService::new(vec![]));
+        let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream {
+            return_error: false,
+        });
         let code: Arc<dyn CodeSearch> = Arc::new(FakeCodeSearch);
         let doc: Arc<dyn DocSearch> = Arc::new(FakeDocSearch);
         let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
         let serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
         let config = make_answer_config();
-        let service = AnswerService::new(
-            &config,
-            chat.clone(),
-            code.clone(),
-            doc.clone(),
-            context.clone(),
+        let db = DbConn::new_in_memory().await.unwrap();
+        let repo = make_repository_service(db.clone()).await.unwrap();
+        let logger = Arc::new(MockEventLogger);
+        let settings = Arc::new(setting::create(db));
+
+        let retrieval = Arc::new(retrieval::create(
+            Some(code.clone()),
+            Some(doc.clone()),
             serper,
-        );
+            repo,
+            settings,
+        ));
+
+        let service = AnswerService::new(logger, &config, auth, chat, retrieval, context);
 
         let attachment = MessageAttachment {
-            doc: vec![tabby_schema::thread::MessageAttachmentDoc {
-                title: "1. Example Document".to_owned(),
-                content: "This is an example".to_owned(),
-                link: "https://example.com".to_owned(),
-            }],
+            doc: vec![tabby_schema::thread::MessageAttachmentDoc::Web(
+                tabby_schema::thread::MessageAttachmentWebDoc {
+                    title: "1. Example Document".to_owned(),
+                    content: "This is an example".to_owned(),
+                    link: "https://example.com".to_owned(),
+                },
+            )],
             code: vec![tabby_schema::thread::MessageAttachmentCode {
                 git_url: "https://github.com".to_owned(),
+                commit: Some("commit".to_owned()),
                 filepath: "server.py".to_owned(),
                 language: "python".to_owned(),
                 content: "print('Hello, server!')".to_owned(),
-                start_line: 1,
+                start_line: Some(1),
             }],
             client_code: vec![tabby_schema::thread::MessageAttachmentClientCode {
                 filepath: Some("client.py".to_owned()),
                 content: "print('Hello, client!')".to_owned(),
                 start_line: Some(1),
             }],
+            code_file_list: None,
         };
 
         let question = "What is the purpose of this code?";
 
         let result = service
-            .generate_relevant_questions_v2(&attachment, question)
+            .generate_relevant_questions(&attachment, question)
             .await;
 
         let expected = vec![
@@ -821,86 +564,102 @@ mod tests {
             "Can you explain how the Flask app works in this context?".to_string(),
         ];
 
-        assert_eq!(result, expected);
+        assert_eq!(result.unwrap(), expected);
     }
+
     #[tokio::test]
-    async fn test_collect_relevant_docs() {
-        let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream);
+    async fn test_generate_relevant_questions_error() {
+        let auth = Arc::new(auth::testutils::FakeAuthService::new(vec![]));
+        let chat: Arc<dyn ChatCompletionStream> =
+            Arc::new(FakeChatCompletionStream { return_error: true });
         let code: Arc<dyn CodeSearch> = Arc::new(FakeCodeSearch);
         let doc: Arc<dyn DocSearch> = Arc::new(FakeDocSearch);
         let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
         let serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
         let config = make_answer_config();
-        let service = AnswerService::new(
-            &config,
-            chat.clone(),
-            code.clone(),
-            doc.clone(),
-            context.clone(),
-            serper,
-        );
+        let db = DbConn::new_in_memory().await.unwrap();
+        let repo = make_repository_service(db.clone()).await.unwrap();
+        let logger = Arc::new(MockEventLogger);
+        let settings = Arc::new(setting::create(db));
 
-        let context_info_helper = make_context_info_helper();
-        let doc_query = tabby_schema::thread::DocQueryInput {
-            content: "Test query Here[[source:source-1]]".to_string(),
-            source_ids: Some(vec!["source-1".to_string()]),
-            search_public: true,
+        let retrieval = Arc::new(retrieval::create(
+            Some(code.clone()),
+            Some(doc.clone()),
+            serper,
+            repo,
+            settings,
+        ));
+
+        let service = AnswerService::new(logger, &config, auth, chat, retrieval, context);
+
+        let attachment = MessageAttachment {
+            doc: vec![tabby_schema::thread::MessageAttachmentDoc::Web(
+                tabby_schema::thread::MessageAttachmentWebDoc {
+                    title: "1. Example Document".to_owned(),
+                    content: "This is an example".to_owned(),
+                    link: "https://example.com".to_owned(),
+                },
+            )],
+            code: vec![tabby_schema::thread::MessageAttachmentCode {
+                git_url: "https://github.com".to_owned(),
+                commit: Some("commit".to_owned()),
+                filepath: "server.py".to_owned(),
+                language: "python".to_owned(),
+                content: "print('Hello, server!')".to_owned(),
+                start_line: Some(1),
+            }],
+            client_code: vec![tabby_schema::thread::MessageAttachmentClientCode {
+                filepath: Some("client.py".to_owned()),
+                content: "print('Hello, client!')".to_owned(),
+                start_line: Some(1),
+            }],
+            code_file_list: None,
         };
 
-        let hits = service
-            .collect_relevant_docs(&context_info_helper, &doc_query)
+        let question = "What is the purpose of this code?";
+
+        let result = service
+            .generate_relevant_questions(&attachment, question)
             .await;
 
-        assert_eq!(hits.len(), 10, "Expected 10 hits from the doc search");
-
-        assert!(
-            hits.iter().any(|hit| hit.doc.title == "Document 1"),
-            "Expected to find a hit with title 'Document 1'"
-        );
+        assert!(result.is_err());
     }
 
-    #[test]
-    fn test_trim_bullet() {
-        assert_eq!(trim_bullet("- Hello"), "Hello");
-        assert_eq!(trim_bullet("* World"), "World");
-        assert_eq!(trim_bullet("1. Test"), "Test");
-        assert_eq!(trim_bullet(".Dot"), "Dot");
-
-        assert_eq!(trim_bullet("- Hello -"), "Hello");
-        assert_eq!(trim_bullet("1. Test 1"), "Test");
-
-        assert_eq!(trim_bullet("--** Mixed"), "Mixed");
-
-        assert_eq!(trim_bullet("  - Hello  "), "Hello");
-
-        assert_eq!(trim_bullet("-"), "");
-        assert_eq!(trim_bullet(""), "");
-        assert_eq!(trim_bullet("   "), "");
-
-        assert_eq!(trim_bullet("Hello World"), "Hello World");
-
-        assert_eq!(trim_bullet("1. *Bold* and -italic-"), "*Bold* and -italic");
-    }
     #[tokio::test]
-    async fn test_answer_v2() {
+    async fn test_answer() {
         use std::sync::Arc;
 
         use futures::StreamExt;
-        use tabby_schema::{policy::AccessPolicy, thread::ThreadRunOptionsInput};
+        use tabby_schema::thread::ThreadRunOptionsInput;
 
-        let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream);
+        let auth = Arc::new(auth::testutils::FakeAuthService::new(vec![]));
+        let chat: Arc<dyn ChatCompletionStream> = Arc::new(FakeChatCompletionStream {
+            return_error: false,
+        });
         let code: Arc<dyn CodeSearch> = Arc::new(FakeCodeSearch);
         let doc: Arc<dyn DocSearch> = Arc::new(FakeDocSearch);
         let context: Arc<dyn ContextService> = Arc::new(FakeContextService);
         let serper = Some(Box::new(FakeDocSearch) as Box<dyn DocSearch>);
 
         let config = make_answer_config();
-        let service = Arc::new(AnswerService::new(
-            &config, chat, code, doc, context, serper,
+        let db = DbConn::new_in_memory().await.unwrap();
+        let repo = make_repository_service(db.clone()).await.unwrap();
+        let logger = Arc::new(MockEventLogger);
+        let settings = Arc::new(setting::create(db.clone()));
+        let retrieval = Arc::new(retrieval::create(
+            Some(code.clone()),
+            Some(doc.clone()),
+            serper,
+            repo,
+            settings,
         ));
 
-        let db = DbConn::new_in_memory().await.unwrap();
-        let policy = AccessPolicy::new(db, &1.as_id(), false);
+        let service = Arc::new(AnswerService::new(
+            logger, &config, auth, chat, retrieval, context,
+        ));
+
+        let user_id = create_user(&db).await;
+        let user = UserSecured::new(db.clone(), db.get_user(user_id).await.unwrap().unwrap());
         let messages = vec![
             make_message(1, "What is Rust?", tabby_schema::thread::Role::User, None),
             make_message(
@@ -917,6 +676,7 @@ mod tests {
             ),
         ];
         let options = ThreadRunOptionsInput {
+            model_name: None,
             code_query: Some(make_code_query_input(
                 Some(TEST_SOURCE_ID),
                 Some(TEST_GIT_URL),
@@ -932,7 +692,7 @@ mod tests {
         let user_attachment_input = None;
 
         let result = service
-            .answer_v2(&policy, &messages, &options, user_attachment_input)
+            .answer(&user, &messages, &options, user_attachment_input)
             .await
             .unwrap();
 
@@ -940,8 +700,8 @@ mod tests {
 
         assert_eq!(
             collected_results.len(),
-            4,
-            "Expected 4 items in the result stream"
+            6,
+            "Expected 6 items in the result stream"
         );
     }
 }

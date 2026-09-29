@@ -198,7 +198,7 @@ export const autoClosingPairs: AutoClosingPair[] = [
   },
 ];
 
-export const regOnlyAutoClosingCloseChars = /^([)\]}>"'`]|(\/>))*$/g;
+export const regOnlyAutoClosingCloseChars = /^([)\]}>"'`]|(\/>)|[;,])*$/g;
 
 // FIXME: This function is not good enough, it can not handle escaped characters.
 export function findUnpairedAutoClosingChars(input: string): string[] {
@@ -288,4 +288,44 @@ export async function parseChatResponse(readableStream: Readable): Promise<strin
     }
   }
   return output;
+}
+
+/**
+ * Format placeholders in the template string.
+ * Example:
+ * ```
+ *   formatPlaceholders("Hello {{name}}", { name: "World" })
+ * ```
+ * @param template a string with placeholders in the form {{key}}
+ * @param replacements a map of replacements for the placeholders
+ * @returns a string with the placeholders replaced
+ */
+export function formatPlaceholders(template: string, replacements: Record<string, string>): string {
+  const patterns = Object.keys(replacements)
+    .map((key) => "{{" + key + "}}")
+    .join("|");
+  const regexp = new RegExp(patterns, "g");
+  return template.replace(regexp, (pattern: string) => {
+    const key = pattern.slice(2, -2);
+    return replacements[key] ?? "";
+  });
+}
+
+/**
+ * Crop the text to fit within the specified character limit.
+ * If the text is cropped, it ensures the last line is complete by trimming at the last newline.
+ *
+ * @param text The input text to crop.
+ * @param maxChars The maximum number of characters allowed.
+ * @returns The cropped text.
+ */
+export function cropTextToMaxChars(text: string, maxChars: number): string {
+  if (text.length > maxChars) {
+    text = text.slice(0, maxChars);
+    const lastNewLine = text.lastIndexOf("\n");
+    if (lastNewLine > 0) {
+      text = text.slice(0, lastNewLine + 1);
+    }
+  }
+  return text;
 }

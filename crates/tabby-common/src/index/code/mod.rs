@@ -10,10 +10,16 @@ use super::{corpus, IndexSchema};
 use crate::api::code::CodeSearchQuery;
 
 pub mod fields {
+    // === Doc level fields ===
+    /// commit ref of the file being indexed.
+    pub const COMMIT: &str = "commit";
+
+    // === Chunk level fields ===
     pub const CHUNK_GIT_URL: &str = "chunk_git_url";
     pub const CHUNK_FILEPATH: &str = "chunk_filepath";
     pub const CHUNK_LANGUAGE: &str = "chunk_language";
     pub const CHUNK_BODY: &str = "chunk_body";
+    /// Optional, when None, it means this chunk contains entire content of the file.
     pub const CHUNK_START_LINE: &str = "chunk_start_line";
 }
 

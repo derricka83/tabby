@@ -1,19 +1,27 @@
+use std::{fs::File, io::Write};
+
+use anyhow::Result;
 use tabby_db::DbConn;
+use tabby_schema::AsID;
 use tracing::warn;
+
+use crate::path::background_jobs_dir;
 
 pub struct JobLogger {
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl JobLogger {
-    pub fn new(db: DbConn, id: i64) -> Self {
+    pub fn new(db: DbConn, id: i64) -> Result<Self> {
         let mut logger = logkit::Logger::new(None);
         logger.mount(logkit::LevelPlugin);
         logger.mount(logkit::TimePlugin::from_micros());
-        let (target, handle) = DbTarget::new(db, id);
+
+        let (target, handle) = DbTarget::new(db, id)?;
         logger.route(target);
+
         logkit::set_default_logger(logger);
-        Self { handle }
+        Ok(Self { handle })
     }
 
     pub async fn finalize(self) {
@@ -29,20 +37,25 @@ struct DbTarget {
 }
 
 impl DbTarget {
-    fn new(db: DbConn, id: i64) -> (Self, tokio::task::JoinHandle<()>) {
-        let (tx, rx) = tokio::sync::mpsc::channel::<Record>(1024);
-        let handle = Self::create_logging_thread(db, id, rx);
-        (Self { tx }, handle)
-    }
-}
+    fn new(db: DbConn, id: i64) -> Result<(Self, tokio::task::JoinHandle<()>)> {
+        let job_dir = background_jobs_dir().join(id.as_id().to_string());
+        std::fs::create_dir_all(&job_dir)?;
+        let stdout_path = job_dir.join("stdout.log");
+        let file = File::create(&stdout_path)?;
 
-impl DbTarget {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Record>(1024);
+        let handle = Self::create_logging_thread(db, id, file, rx)?;
+        Ok((Self { tx }, handle))
+    }
+
     fn create_logging_thread(
         db: DbConn,
         id: i64,
+        file: File,
         mut rx: tokio::sync::mpsc::Receiver<Record>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let mut file = file.try_clone()?;
+        Ok(tokio::spawn(async move {
             while let Some(record) = rx.recv().await {
                 let stdout = format!(
                     "{} [{}]: {}\n",
@@ -51,11 +64,11 @@ impl DbTarget {
                     record.msg
                 );
 
-                match db.update_job_stdout(id, stdout).await {
-                    Ok(_) => (),
-                    Err(_) => {
-                        warn!("Failed to write stdout to job `{}`", id);
-                    }
+                if let Err(err) = file.write_all(stdout.as_bytes()) {
+                    warn!("Failed to write log record to file: {}", err);
+                }
+                if let Err(err) = file.flush() {
+                    warn!("Failed to flush log buffer: {}", err);
                 }
 
                 if let Some(exit_code) = record.exit_code {
@@ -67,7 +80,7 @@ impl DbTarget {
                     }
                 }
             }
-        })
+        }))
     }
 }
 

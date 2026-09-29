@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{stream::BoxStream, StreamExt};
@@ -22,10 +20,13 @@ pub struct OllamaCompletion {
 
 #[async_trait]
 impl CompletionStream for OllamaCompletion {
-    async fn generate(&self, prompt: &str, options: CompletionOptions) -> BoxStream<String> {
+    async fn generate(
+        &self,
+        prompt: &str,
+        options: CompletionOptions,
+    ) -> BoxStream<'life0, String> {
         // FIXME: options.presence_penalty is not used
         let ollama_options = GenerationOptions::default()
-            .num_ctx(options.max_input_length as u32)
             .num_predict(options.max_decoding_tokens)
             .seed(options.seed as i32)
             .repeat_last_n(0)
@@ -58,11 +59,11 @@ impl CompletionStream for OllamaCompletion {
     }
 }
 
-pub async fn create(config: &HttpModelConfig) -> Arc<dyn CompletionStream> {
+pub async fn create(config: &HttpModelConfig) -> Box<dyn CompletionStream> {
     let connection = Ollama::try_new(config.api_endpoint.as_deref().unwrap().to_owned())
         .expect("Failed to create connection to Ollama, URL invalid");
 
     let model = connection.select_model_or_default(config).await.unwrap();
 
-    Arc::new(OllamaCompletion { connection, model })
+    Box::new(OllamaCompletion { connection, model })
 }

@@ -123,19 +123,6 @@ export default {
             ],
           },
           {
-            title: 'Community',
-            items: [
-              {
-                label: 'Slack',
-                href: 'https://slack.tabbyml.com',
-              },
-              {
-                label: 'GitHub',
-                href: 'https://github.com/TabbyML/tabby',
-              },
-            ],
-          },
-          {
             title: 'More',
             items: [
               {
@@ -201,6 +188,18 @@ export default {
           {
             to: '/blog/2024/02/05/create-tabby-extension-with-language-server-protocol',
             from: '/blog/running-tabby-as-a-language-server'
+          },
+          {
+            to: '/blog/2023/09/05/deploy-tabby-to-huggingface-space',
+            from: '/blog/deploy-tabby-to-huggingface-space.md',
+          },
+          {
+            to: '/blog/2023/08/31/first-stable-release',
+            from: '/blog/first-stable-release',
+          },
+          {
+            to: '/blog/2023/10/14/seed-round-release-0-3-0',
+            from: '/blog/2023/10/14/seed-round-release-0-3-0-RAG',
           },
           {
             to: '/docs/quick-start/installation/docker',

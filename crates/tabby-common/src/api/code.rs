@@ -2,20 +2,18 @@ use async_trait::async_trait;
 use derive_builder::Builder;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use utoipa::ToSchema;
 
-#[derive(Default, Serialize, Deserialize, Debug)]
 pub struct CodeSearchResponse {
     pub hits: Vec<CodeSearchHit>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, ToSchema)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub struct CodeSearchHit {
     pub scores: CodeSearchScores,
     pub doc: CodeSearchDocument,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, ToSchema)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub struct CodeSearchScores {
     /// Reciprocal rank fusion score: https://www.elastic.co/guide/en/elasticsearch/reference/current/rrf.html
     pub rrf: f32,
@@ -23,22 +21,24 @@ pub struct CodeSearchScores {
     pub embedding: f32,
 }
 
-#[derive(Serialize, Deserialize, Debug, Builder, Clone, Default, ToSchema)]
+#[derive(Builder, Default, Clone, PartialEq, Debug)]
 pub struct CodeSearchDocument {
     /// Unique identifier for the file in the repository, stringified SourceFileKey.
-    ///
-    /// Skipped in API responses.
-    #[serde(skip_serializing)]
     pub file_id: String,
-
-    #[serde(skip_serializing)]
     pub chunk_id: String,
 
     pub body: String,
     pub filepath: String,
     pub git_url: String,
+
+    // FIXME(kweizh): This should be a required field after 0.25.0.
+    // commit represents the specific revision at which the file was last edited.
+    pub commit: Option<String>,
+
     pub language: String,
-    pub start_line: usize,
+
+    /// When start line is `None`, it represents the entire file.
+    pub start_line: Option<usize>,
 }
 
 #[derive(Error, Debug)]
@@ -56,13 +56,11 @@ pub enum CodeSearchError {
     Other(#[from] anyhow::Error),
 }
 
-#[derive(Deserialize, ToSchema)]
 pub struct CodeSearchQuery {
+    /// filepath in code search query always normalize to unix style.
     pub filepath: Option<String>,
     pub language: Option<String>,
     pub content: String,
-
-    #[serde(skip)]
     pub source_id: String,
 }
 
@@ -74,7 +72,7 @@ impl CodeSearchQuery {
         source_id: String,
     ) -> Self {
         Self {
-            filepath,
+            filepath: filepath.map(|path| normalize_to_unix_path(&path)),
             language,
             content,
             source_id,
@@ -115,4 +113,33 @@ pub trait CodeSearch: Send + Sync {
         query: CodeSearchQuery,
         params: CodeSearchParams,
     ) -> Result<CodeSearchResponse, CodeSearchError>;
+}
+
+/// Normalize the path form different platform to unix style path
+pub fn normalize_to_unix_path(filepath: &str) -> String {
+    filepath.replace('\\', "/")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_relative_path_normalization() {
+        let unix_test_cases = [
+            ("./src/main.rs", "./src/main.rs"),
+            (".\\src\\main.rs", "./src/main.rs"),
+            ("../test/data.json", "../test/data.json"),
+            ("..\\test\\data.json", "../test/data.json"),
+            ("src/test/file.txt", "src/test/file.txt"),
+            ("src\\test\\file.txt", "src/test/file.txt"),
+        ];
+
+        for (input, expected) in unix_test_cases {
+            assert_eq!(
+                normalize_to_unix_path(input),
+                expected.to_string(),
+                "Failed to normalize path: {input}"
+            );
+        }
+    }
 }

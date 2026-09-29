@@ -12,6 +12,8 @@ import {
 import { CodeLensMiddleware as VscodeLspCodeLensMiddleware, ProvideCodeLensesSignature } from "vscode-languageclient";
 import { CodeLens as TabbyCodeLens } from "tabby-agent";
 import { findTextEditor } from "./vscodeWindowUtils";
+import { isBrowser } from "../env";
+import { formatShortcut, KeyBindingManager } from "../keybindings";
 
 type CodeLens = VscodeCodeLens & TabbyCodeLens;
 
@@ -39,26 +41,41 @@ const decorationTypePending = window.createTextEditorDecorationType({
   isWholeLine: true,
   rangeBehavior: DecorationRangeBehavior.ClosedClosed,
 });
-const decorationTypeInserted = window.createTextEditorDecorationType({
+const decorationTypeTextInserted = window.createTextEditorDecorationType({
   backgroundColor: new ThemeColor("diffEditor.insertedTextBackground"),
-  isWholeLine: true,
-  rangeBehavior: DecorationRangeBehavior.ClosedClosed,
+  isWholeLine: false,
+  rangeBehavior: DecorationRangeBehavior.ClosedOpen,
 });
-const decorationTypeDeleted = window.createTextEditorDecorationType({
+const decorationTypeTextDeleted = window.createTextEditorDecorationType({
   backgroundColor: new ThemeColor("diffEditor.removedTextBackground"),
+  isWholeLine: false,
+  rangeBehavior: DecorationRangeBehavior.ClosedOpen,
+});
+const decorationTypeLineInserted = window.createTextEditorDecorationType({
+  backgroundColor: new ThemeColor("diffEditor.insertedLineBackground"),
   isWholeLine: true,
   rangeBehavior: DecorationRangeBehavior.ClosedClosed,
 });
-const decorationTypes: Record<string, TextEditorDecorationType> = {
+const decorationTypeLineDeleted = window.createTextEditorDecorationType({
+  backgroundColor: new ThemeColor("diffEditor.removedLineBackground"),
+  isWholeLine: true,
+  rangeBehavior: DecorationRangeBehavior.ClosedClosed,
+});
+const lineDecorationTypes: Record<string, TextEditorDecorationType> = {
   header: decorationTypeHeader,
   footer: decorationTypeFooter,
   commentsFirstLine: decorationTypeComments,
   comments: decorationTypeComments,
   waiting: decorationTypePending,
-  inProgress: decorationTypeInserted,
+  inProgress: decorationTypeLineInserted,
   unchanged: decorationTypeUnchanged,
-  inserted: decorationTypeInserted,
-  deleted: decorationTypeDeleted,
+  inserted: decorationTypeLineInserted,
+  deleted: decorationTypeLineDeleted,
+};
+
+const textDecorationTypes: Record<string, TextEditorDecorationType> = {
+  inserted: decorationTypeTextInserted,
+  deleted: decorationTypeTextDeleted,
 };
 
 export class CodeLensMiddleware implements VscodeLspCodeLensMiddleware {
@@ -87,6 +104,8 @@ export class CodeLensMiddleware implements VscodeLspCodeLensMiddleware {
     if (!codeLens.data || codeLens.data.type !== "previewChanges") {
       return codeLens;
     }
+    this.appendShortcutHint(codeLens);
+
     const decorationRange = new Range(
       codeLens.range.start.line,
       codeLens.range.start.character,
@@ -94,8 +113,15 @@ export class CodeLensMiddleware implements VscodeLspCodeLensMiddleware {
       codeLens.range.end.character,
     );
     const lineType = codeLens.data.line;
-    if (typeof lineType === "string" && lineType in decorationTypes) {
-      const decorationType = decorationTypes[lineType];
+    if (typeof lineType === "string" && lineType in lineDecorationTypes) {
+      const decorationType = lineDecorationTypes[lineType];
+      if (decorationType) {
+        this.addDecorationRange(editor, decorationType, decorationRange);
+      }
+    }
+    const textType = codeLens.data.text;
+    if (typeof textType === "string" && textType in textDecorationTypes) {
+      const decorationType = textDecorationTypes[textType];
       if (decorationType) {
         this.addDecorationRange(editor, decorationType, decorationRange);
       }
@@ -125,6 +151,27 @@ export class CodeLensMiddleware implements VscodeLspCodeLensMiddleware {
     }
     ranges.push(range);
     editor.setDecorations(decorationType, ranges);
+  }
+  private appendShortcutHint(codeLens: CodeLens) {
+    if (!codeLens.command) return;
+
+    const action = codeLens.command?.arguments?.[0]?.action;
+    if (!action) return;
+
+    let commandId: string;
+    if (action === "accept") {
+      commandId = "tabby.chat.edit.accept";
+    } else if (action === "discard") {
+      commandId = "tabby.chat.edit.discard";
+    } else {
+      return;
+    }
+    const binding = KeyBindingManager.getInstance().getKeybinding(commandId);
+
+    const formattedShortcut = binding ? formatShortcut(binding) : "";
+    const shortcutText = isBrowser ? "" : formattedShortcut ? ` (${formattedShortcut})` : "";
+
+    codeLens.command.title += shortcutText;
   }
 
   private removeDecorations(editor: TextEditor) {

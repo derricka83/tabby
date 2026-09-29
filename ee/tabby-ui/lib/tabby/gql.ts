@@ -23,15 +23,24 @@ import {
   GitRepositoriesQueryVariables,
   ListIntegrationsQueryVariables,
   ListInvitationsQueryVariables,
+  ListMyThreadsQueryVariables,
+  ListPageSectionsQueryVariables,
+  ListThreadsQueryVariables,
+  NotificationsQueryVariables,
   SourceIdAccessPoliciesQueryVariables,
   UpsertUserGroupMembershipInput
 } from '../gql/generates/graphql'
+import { ExtendedCombinedError } from '../types'
 import { refreshTokenMutation } from './auth'
 import {
   listIntegrations,
   listInvitations,
+  listMyThreads,
+  listPageSections,
   listRepositories,
   listSourceIdAccessPolicies,
+  listThreads,
+  notificationsQuery,
   userGroupsQuery
 } from './query'
 import {
@@ -88,8 +97,10 @@ function useMutation<TResult, TVariables extends AnyVariables>(
   return fn
 }
 
-function makeFormErrorHandler<T extends FieldValues>(form: UseFormReturn<T>) {
-  return (err: CombinedError) => {
+export function makeFormErrorHandler<T extends FieldValues>(
+  form: UseFormReturn<T>
+) {
+  return (err: ExtendedCombinedError) => {
     const { graphQLErrors = [] } = err
     for (const error of graphQLErrors) {
       if (error.extensions && error.extensions['validation-errors']) {
@@ -127,14 +138,26 @@ const client = new Client({
         MessageAttachment: () => null,
         MessageAttachmentCode: () => null,
         MessageAttachmentDoc: () => null,
-        NetworkSetting: () => null
+        NetworkSetting: () => null,
+        ContextInfo: () => null,
+        PageCreated: () => null,
+        PageContentCompleted: () => null,
+        PageSectionsCreated: () => null,
+        PageSectionContentCompleted: () => null,
+        PageSectionAttachmentCode: () => null,
+        PageSectionAttachmentDoc: () => null,
+        SectionAttachment: () => null,
+        PageSectionCreated: () => null,
+        BrandingSetting: () => 'BrandingSetting'
       },
       resolvers: {
         Query: {
           invitations: relayPagination(),
           gitRepositories: relayPagination(),
           webCrawlerUrls: relayPagination(),
-          integrations: relayPagination()
+          integrations: relayPagination(),
+          threads: relayPagination(),
+          myThreads: relayPagination()
         }
       },
       updates: {
@@ -369,6 +392,139 @@ const client = new Client({
                     }
                   )
                 })
+            }
+          },
+          deleteThread(result, args, cache, info) {
+            if (result.deleteThread) {
+              cache
+                .inspectFields('Query')
+                // Update the cache within the thread-feeds only
+                .filter(
+                  field =>
+                    field.fieldName === 'threads' && !field.arguments?.ids
+                )
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listThreads,
+                      variables: field.arguments as ListThreadsQueryVariables
+                    },
+                    data => {
+                      if (data?.threads) {
+                        data.threads.edges = data.threads.edges.filter(
+                          e => e.node.id !== args.id
+                        )
+                      }
+                      return data
+                    }
+                  )
+                })
+
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'myThreads')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listMyThreads,
+                      variables: field.arguments as ListMyThreadsQueryVariables
+                    },
+                    data => {
+                      if (data?.myThreads) {
+                        data.myThreads.edges = data.myThreads.edges.filter(
+                          e => e.node.id !== args.id
+                        )
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
+          },
+          setThreadPersisted(result, args, cache, info) {
+            if (result.setThreadPersisted) {
+              const key = 'Query'
+              cache
+                .inspectFields(key)
+                .filter(field => {
+                  return (
+                    field.fieldName === 'threads' &&
+                    !field.arguments?.ids &&
+                    !!field.arguments?.before
+                  )
+                })
+                .forEach(field => {
+                  cache.invalidate(key, field.fieldName, field.arguments)
+                })
+            }
+          },
+          markNotificationsRead(result, args, cache) {
+            if (result.markNotificationsRead) {
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'notifications')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: notificationsQuery,
+                      variables: field.arguments as NotificationsQueryVariables
+                    },
+                    data => {
+                      if (data?.notifications) {
+                        const isMarkAllAsRead = !args.notificationId
+                        data.notifications = data.notifications.map(item => {
+                          if (isMarkAllAsRead) {
+                            return {
+                              ...item,
+                              read: true
+                            }
+                          } else {
+                            if (item.id === args.notificationId) {
+                              return {
+                                ...item,
+                                read: true
+                              }
+                            }
+                            return item
+                          }
+                        })
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
+          },
+          deletePageSection(result, args, cache) {
+            if (result.deletePageSection) {
+              cache
+                .inspectFields('Query')
+                .filter(field => field.fieldName === 'pageSections')
+                .forEach(field => {
+                  cache.updateQuery(
+                    {
+                      query: listPageSections,
+                      variables:
+                        field.arguments as ListPageSectionsQueryVariables
+                    },
+                    data => {
+                      if (data?.pageSections) {
+                        data.pageSections.edges =
+                          data.pageSections.edges.filter(
+                            e => e.node.id !== args.id
+                          )
+                      }
+                      return data
+                    }
+                  )
+                })
+            }
+          },
+          updateBrandingSetting(result, args, cache) {
+            if (result.updateBrandingSetting) {
+              cache.invalidate({
+                __typename: 'BrandingSetting'
+              })
             }
           }
         }

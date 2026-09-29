@@ -2,11 +2,11 @@ use std::{fs, sync::Arc};
 
 pub use llama_cpp_server::PromptInfo;
 use tabby_common::config::ModelConfig;
-use tabby_download::download_model;
+use tabby_download::{download_model, ModelKind};
 use tabby_inference::{ChatCompletionStream, CodeGeneration, CompletionStream, Embedding};
 use tracing::info;
 
-pub async fn load_embedding(config: &ModelConfig) -> Arc<dyn Embedding> {
+pub async fn load_embedding(config: &ModelConfig) -> Option<Arc<dyn Embedding>> {
     llama_cpp_server::create_embedding(config).await
 }
 
@@ -15,13 +15,16 @@ pub async fn load_code_generation_and_chat(
     chat_model: Option<ModelConfig>,
 ) -> (
     Option<Arc<CodeGeneration>>,
-    Option<PromptInfo>,
+    Option<Arc<dyn CompletionStream>>,
     Option<Arc<dyn ChatCompletionStream>>,
+    Option<PromptInfo>,
 ) {
     let (engine, prompt_info, chat) =
         load_completion_and_chat(completion_model.clone(), chat_model).await;
-    let code = engine.map(|engine| Arc::new(CodeGeneration::new(engine, completion_model)));
-    (code, prompt_info, chat)
+    let code = engine
+        .clone()
+        .map(|engine| Arc::new(CodeGeneration::new(engine, completion_model)));
+    (code, engine, chat, prompt_info)
 }
 
 async fn load_completion_and_chat(
@@ -77,10 +80,10 @@ async fn load_completion_and_chat(
     (completion, prompt, chat)
 }
 
-pub async fn download_model_if_needed(model: &str) {
+pub async fn download_model_if_needed(model: &str, kind: ModelKind) {
     if fs::metadata(model).is_ok() {
         info!("Loading model from local path {}", model);
     } else {
-        download_model(model, true).await;
+        download_model(model, true, Some(kind)).await;
     }
 }

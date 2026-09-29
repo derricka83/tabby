@@ -1,6 +1,7 @@
 mod chat;
 mod completion;
 mod embedding;
+mod rate_limit;
 
 pub use chat::create as create_chat;
 pub use completion::{build_completion_prompt, create};
@@ -19,3 +20,5 @@ fn create_reqwest_client(api_endpoint: &str) -> reqwest::Client {
 
     builder.build().unwrap()
 }
+
+static AZURE_API_VERSION: &str = "2024-02-01";

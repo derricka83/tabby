@@ -1,7 +1,11 @@
 use std::sync::Arc;
 
 use tabby_schema::{
-    context::{ContextInfo, ContextService, ContextSourceValue, WebContextSource},
+    context::{
+        ContextInfo, ContextService, ContextSourceValue, IngestedContextSource, PageContextSource,
+        WebContextSource,
+    },
+    ingestion::IngestionService,
     policy::AccessPolicy,
     repository::RepositoryService,
     web_documents::WebDocumentService,
@@ -10,6 +14,7 @@ use tabby_schema::{
 
 struct ContextServiceImpl {
     repository: Arc<dyn RepositoryService>,
+    ingestion: Arc<dyn IngestionService>,
     web_document: Arc<dyn WebDocumentService>,
     can_search_public_web: bool,
 }
@@ -56,17 +61,33 @@ impl ContextService for ContextServiceImpl {
             sources = filtered_sources
         }
 
+        sources.push(PageContextSource.into());
+        sources.extend(
+            self.ingestion
+                .list_sources(None, None)
+                .await?
+                .into_iter()
+                .map(|source| {
+                    ContextSourceValue::IngestedContextSource(IngestedContextSource {
+                        id: source.clone(),
+                        name: self.ingestion.source_name_from_id(&source),
+                    })
+                }),
+        );
+
         Ok(ContextInfo { sources })
     }
 }
 
 pub fn create(
     repository: Arc<dyn RepositoryService>,
+    ingestion: Arc<dyn IngestionService>,
     web_document: Arc<dyn WebDocumentService>,
     can_search_public_web: bool,
 ) -> impl ContextService {
     ContextServiceImpl {
         repository,
+        ingestion,
         web_document,
         can_search_public_web,
     }

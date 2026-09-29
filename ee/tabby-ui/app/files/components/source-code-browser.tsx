@@ -2,6 +2,7 @@
 
 import React, { PropsWithChildren, useState } from 'react'
 import { usePathname } from 'next/navigation'
+import type { EditorView } from '@codemirror/view'
 import { createRequest } from '@urql/core'
 import { compact, isEmpty, isNil, toNumber } from 'lodash-es'
 import { ImperativePanelHandle } from 'react-resizable-panels'
@@ -22,11 +23,11 @@ import {
   ResizablePanel,
   ResizablePanelGroup
 } from '@/components/ui/resizable'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { BANNER_HEIGHT, useShowDemoBanner } from '@/components/demo-banner'
 import { ListSkeleton } from '@/components/skeleton'
 import { useTopbarProgress } from '@/components/topbar-progress-indicator'
 
-import { emitter, QuickActionEventPayload } from '../lib/event-emitter'
 import { BlobModeView } from './blob-mode-view'
 import { ChatSideBar } from './chat-side-bar'
 import { CodeSearchBar } from './code-search-bar'
@@ -127,8 +128,6 @@ type SourceCodeBrowserContextValue = {
   fileTreeData: TFileTreeNode[]
   chatSideBarVisible: boolean
   setChatSideBarVisible: React.Dispatch<React.SetStateAction<boolean>>
-  pendingEvent: QuickActionEventPayload | undefined
-  setPendingEvent: (d: QuickActionEventPayload | undefined) => void
   isChatEnabled: boolean | undefined
   activeRepo: RepositoryItem | undefined
   activeRepoRef:
@@ -143,6 +142,7 @@ type SourceCodeBrowserContextValue = {
   prevActivePath: React.MutableRefObject<string | undefined>
   error: Error | undefined
   setError: (e: Error | undefined) => void
+  textEditorViewRef: React.MutableRefObject<EditorView | null>
 }
 
 const SourceCodeBrowserContext =
@@ -170,12 +170,9 @@ const SourceCodeBrowserContextProvider: React.FC<PropsWithChildren> = ({
   >({})
   const [expandedKeys, setExpandedKeys] = React.useState<Set<string>>(new Set())
   const [chatSideBarVisible, setChatSideBarVisible] = React.useState(false)
-  const [pendingEvent, setPendingEvent] = React.useState<
-    QuickActionEventPayload | undefined
-  >()
   const [error, setError] = useState<Error | undefined>()
   const prevActivePath = React.useRef<string | undefined>()
-
+  const textEditorViewRef = React.useRef<EditorView | null>(null)
   const updateActivePath: SourceCodeBrowserContextValue['updateActivePath'] =
     React.useCallback(async (path, options) => {
       const replace = options?.replace
@@ -191,7 +188,12 @@ const SourceCodeBrowserContextProvider: React.FC<PropsWithChildren> = ({
         })
       } else {
         const setParams: Record<string, string> = {}
-        let delList = ['redirect_filepath', 'redirect_git_url', 'line']
+        let delList = [
+          'redirect_filepath',
+          'redirect_git_url',
+          'redirect_rev',
+          'line'
+        ]
         if (options?.plain) {
           setParams['plain'] = '1'
         } else {
@@ -320,8 +322,6 @@ const SourceCodeBrowserContextProvider: React.FC<PropsWithChildren> = ({
         fileTreeData,
         chatSideBarVisible,
         setChatSideBarVisible,
-        pendingEvent,
-        setPendingEvent,
         isChatEnabled,
         repoMap,
         setRepoMap,
@@ -331,7 +331,8 @@ const SourceCodeBrowserContextProvider: React.FC<PropsWithChildren> = ({
         activeEntryInfo,
         prevActivePath,
         error,
-        setError
+        setError,
+        textEditorViewRef
       }}
     >
       {children}
@@ -355,7 +356,6 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
     setInitialized,
     chatSideBarVisible,
     setChatSideBarVisible,
-    setPendingEvent,
     repoMap,
     setRepoMap,
     activeRepo,
@@ -373,6 +373,7 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
   const { progress, setProgress } = useTopbarProgress()
   const chatSideBarPanelRef = React.useRef<ImperativePanelHandle>(null)
   const [chatSideBarPanelSize, setChatSideBarPanelSize] = React.useState(35)
+
   const searchQuery = searchParams.get('q')?.toString()
 
   const parsedEntryInfo = React.useMemo(() => {
@@ -500,13 +501,19 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
       const repos = await fetchAllRepositories()
       const redirect_filepath = searchParams.get('redirect_filepath')
       const redirect_git_url = searchParams.get('redirect_git_url')
+      const redirect_rev = searchParams.get('redirect_rev')
 
       if (repos?.length && redirect_filepath && redirect_git_url) {
         const targetRepo = repos.find(repo => repo.gitUrl === redirect_git_url)
         if (targetRepo) {
-          // use default rev
-          const defaultRef = getDefaultRepoRef(targetRepo.refs)
-          const refName = resolveRepoRef(defaultRef)?.name || ''
+          let refName = ''
+          if (redirect_rev) {
+            refName = redirect_rev
+          } else {
+            // use default rev
+            const defaultRef = getDefaultRepoRef(targetRepo.refs)
+            refName = resolveRepoRef(defaultRef)?.name || ''
+          }
 
           const lineRangeInHash = parseLineNumberFromHash(window.location.hash)
           const isValidLineHash = !isNil(lineRangeInHash?.start)
@@ -607,12 +614,16 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
   }, [fetchingRawFile, fetchingTreeEntries])
 
   React.useEffect(() => {
-    if (chatSideBarVisible) {
-      chatSideBarPanelRef.current?.expand()
-      chatSideBarPanelRef.current?.resize(chatSideBarPanelSize)
-    } else {
-      chatSideBarPanelRef.current?.collapse()
+    const toggleChatSidebarPanel = () => {
+      if (chatSideBarVisible) {
+        chatSideBarPanelRef.current?.expand()
+        chatSideBarPanelRef.current?.resize(chatSideBarPanelSize)
+      } else {
+        chatSideBarPanelRef.current?.collapse()
+      }
     }
+
+    toggleChatSidebarPanel()
   }, [chatSideBarVisible])
 
   React.useEffect(() => {
@@ -627,18 +638,6 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
       setExpandedKeys(new Set())
     }
   }, [activeEntryInfo])
-
-  React.useEffect(() => {
-    const onCallCompletion = (data: QuickActionEventPayload) => {
-      setChatSideBarVisible(true)
-      setPendingEvent(data)
-    }
-    emitter.on('code_browser_quick_action', onCallCompletion)
-
-    return () => {
-      emitter.off('code_browser_quick_action', onCallCompletion)
-    }
-  }, [])
 
   return (
     <ResizablePanelGroup
@@ -656,55 +655,57 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
       </ResizablePanel>
       <ResizableHandle className="hidden w-1 bg-border/40 hover:bg-border active:bg-blue-500 lg:block" />
       <ResizablePanel defaultSize={80} minSize={30}>
-        <div className="flex h-full flex-col">
+        <div className="mb-4 flex h-full flex-col">
           <CodeSearchBar
             className={cn(
               'z-40',
               !!activeEntryInfo?.repositorySpecifier ? 'block' : 'hidden'
             )}
           />
-          <div className="flex h-full flex-col overflow-y-auto px-4 pb-4">
-            {(isTreeMode || isBlobMode) && (
-              <FileDirectoryBreadcrumb
-                className={cn('pb-4', {
-                  'pt-4': !activeEntryInfo?.repositorySpecifier
-                })}
-              />
-            )}
-            {!initialized ? (
-              <ListSkeleton className="rounded-lg border p-4" />
-            ) : showErrorView ? (
-              <ErrorView
-                className={`rounded-lg border p-4`}
-                error={viewAffectingError}
-              />
-            ) : (
-              <>
-                {isTreeMode && (
-                  <TreeModeView
-                    loading={fetchingTreeEntries}
-                    initialized={initialized}
-                    className={`rounded-lg border`}
-                  />
-                )}
-                {isBlobMode && (
-                  <BlobModeView
-                    blob={fileBlob}
-                    contentLength={contentLength}
-                    fileDisplayType={fileDisplayType}
-                    loading={fetchingRawFile || fetchingTreeEntries}
-                  />
-                )}
-                {isSearchMode && (
-                  <CodeSearchResultView
-                    results={repositoryGreps?.files}
-                    requestDuration={repositoryGreps?.elapsedMs}
-                    loading={fetchingRepositoryGrep}
-                  />
-                )}
-              </>
-            )}
-          </div>
+          {(isTreeMode || isBlobMode) && (
+            <FileDirectoryBreadcrumb
+              className={cn('px-4 pb-4', {
+                'pt-4': !activeEntryInfo?.repositorySpecifier
+              })}
+            />
+          )}
+          <ScrollArea>
+            <div className="flex h-full flex-col px-4 pb-4">
+              {!initialized ? (
+                <ListSkeleton className="rounded-lg border p-4" />
+              ) : showErrorView ? (
+                <ErrorView
+                  className={`rounded-lg border p-4`}
+                  error={viewAffectingError}
+                />
+              ) : (
+                <>
+                  {isTreeMode && (
+                    <TreeModeView
+                      loading={fetchingTreeEntries}
+                      initialized={initialized}
+                      className={`rounded-lg border`}
+                    />
+                  )}
+                  {isBlobMode && (
+                    <BlobModeView
+                      blob={fileBlob}
+                      contentLength={contentLength}
+                      fileDisplayType={fileDisplayType}
+                      loading={fetchingRawFile || fetchingTreeEntries}
+                    />
+                  )}
+                  {isSearchMode && (
+                    <CodeSearchResultView
+                      results={repositoryGreps?.files}
+                      requestDuration={repositoryGreps?.elapsedMs}
+                      loading={fetchingRepositoryGrep}
+                    />
+                  )}
+                </>
+              )}
+            </div>
+          </ScrollArea>
         </div>
       </ResizablePanel>
       <>
@@ -722,7 +723,7 @@ const SourceCodeBrowserRenderer: React.FC<SourceCodeBrowserProps> = ({
           ref={chatSideBarPanelRef}
           onCollapse={() => setChatSideBarVisible(false)}
         >
-          <ChatSideBar />
+          <ChatSideBar activeRepo={activeRepo} />
         </ResizablePanel>
       </>
     </ResizablePanelGroup>

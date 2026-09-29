@@ -8,6 +8,7 @@ use strum::IntoEnumIterator;
 use tabby_common::config::{CodeRepository, RepositoryConfig};
 use tabby_db::{DbConn, ProvidedRepositoryDAO};
 use tabby_schema::{
+    bail,
     integration::{Integration, IntegrationKind, IntegrationService},
     job::{JobInfo, JobService},
     repository::{
@@ -16,7 +17,7 @@ use tabby_schema::{
     },
     AsID, AsRowid, DbEnum, Result,
 };
-use tracing::{debug, error};
+use tracing::debug;
 
 use self::fetch::RepositoryInfo;
 use super::to_repository;
@@ -70,10 +71,10 @@ impl RepositoryProvider for ThirdPartyRepositoryServiceImpl {
     }
 
     async fn get_repository(&self, id: &ID) -> Result<Repository> {
-        let repo = self.get_provided_repository(id.clone()).await?;
+        let repo = self.get_provided_repository(id).await?;
         let provider = self
             .integration
-            .get_integration(repo.integration_id.clone())
+            .get_integration(&repo.integration_id)
             .await?;
         Ok(to_repository(provider.kind.into(), repo))
     }
@@ -119,18 +120,23 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
         Ok(converted_repositories)
     }
 
-    async fn get_provided_repository(&self, id: ID) -> Result<ProvidedRepository> {
+    async fn get_provided_repository(&self, id: &ID) -> Result<ProvidedRepository> {
         let repo = self.db.get_provided_repository(id.as_rowid()?).await?;
 
-        let event = BackgroundJobEvent::SchedulerGithubGitlabRepository(id);
+        let event = BackgroundJobEvent::SchedulerGithubGitlabRepository(id.clone());
         let last_job_run = self.job.get_job_info(event.to_command()).await?;
 
         Ok(to_provided_repository(repo, last_job_run))
     }
 
-    async fn update_repository_active(&self, id: ID, active: bool) -> Result<()> {
+    async fn update_repository_active(
+        &self,
+        id: ID,
+        active: bool,
+        refs: Option<Vec<String>>,
+    ) -> Result<()> {
         self.db
-            .update_provided_repository_active(id.as_rowid()?, active)
+            .update_provided_repository_active(id.as_rowid()?, active, refs)
             .await?;
 
         if active {
@@ -152,8 +158,21 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
         Ok(())
     }
 
+    async fn update_repository_refs(&self, id: ID, refs: Vec<String>) -> Result<()> {
+        self.db
+            .update_provided_repository_refs(id.as_rowid()?, refs)
+            .await?;
+
+        let _ = self
+            .job
+            .trigger(BackgroundJobEvent::SchedulerGithubGitlabRepository(id).to_command())
+            .await;
+
+        Ok(())
+    }
+
     async fn sync_repositories(&self, integration_id: ID) -> Result<()> {
-        let provider = self.integration.get_integration(integration_id).await?;
+        let provider = self.integration.get_integration(&integration_id).await?;
         debug!(
             "Refreshing repositories for provider: {}",
             provider.display_name
@@ -167,15 +186,15 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
         .await
         {
             Ok(repos) => repos,
-            Err(e) => {
+            Err(err) => {
                 self.integration
-                    .update_integration_sync_status(provider.id.clone(), Some(e.to_string()))
+                    .update_integration_sync_status(&provider.id, Some(err.to_string()))
                     .await?;
-                error!(
-                    "Failed to fetch repositories from integration: {}",
-                    provider.display_name
+                bail!(
+                    "Failed to retrieve repositories from the specified integration: {}. An error occurred: {}. Please verify your context provider settings to resolve the issue.",
+                    provider.display_name,
+                    err
                 );
-                return Err(e.into());
             }
         };
 
@@ -244,7 +263,11 @@ impl ThirdPartyRepositoryService for ThirdPartyRepositoryServiceImpl {
                 let url = integration
                     .kind
                     .format_authenticated_url(&repository.git_url, &integration.access_token)?;
-                urls.push(CodeRepository::new(&url, &repository.source_id()));
+                urls.push(CodeRepository::new(
+                    &url,
+                    &repository.source_id(),
+                    repository.refs.iter().map(|r| r.name.clone()).collect(),
+                ));
             }
         }
 
@@ -260,18 +283,16 @@ async fn refresh_repositories_for_provider(
 ) -> Result<()> {
     let start = Utc::now();
 
+    debug!("importing {} repositories", repos.len());
     for repo in repos {
-        debug!("importing: {}", repo.name);
-
         let id = repo.vendor_id;
 
         repository
             .upsert_repository(provider.id.clone(), id, repo.name, repo.git_url)
             .await?;
     }
-
     integration
-        .update_integration_sync_status(provider.id.clone(), None)
+        .update_integration_sync_status(&provider.id, None)
         .await?;
     let num_removed = repository
         .delete_outdated_repositories(provider.id, start)
@@ -282,6 +303,47 @@ async fn refresh_repositories_for_provider(
 
 fn to_provided_repository(value: ProvidedRepositoryDAO, job_info: JobInfo) -> ProvidedRepository {
     let id = value.id.as_id();
+    let all_refs =
+        tabby_git::list_refs(&RepositoryConfig::resolve_dir(&value.git_url)).unwrap_or_default();
+
+    let refs = if let Some(refs) = &value.refs {
+        let config_refs: Vec<String> = serde_json::from_str(refs).unwrap_or_default();
+
+        config_refs
+            .into_iter()
+            .map(|name| {
+                let ref_name = all_refs
+                    .iter()
+                    .find(|r| {
+                        r.name == format!("refs/heads/{name}")
+                            || r.name == format!("refs/tags/{name}")
+                    })
+                    .map(|r| r.name.clone())
+                    .unwrap_or(format!("refs/heads/{name}"));
+
+                let commit = all_refs
+                    .iter()
+                    .find(|r| r.name == ref_name)
+                    .map(|r| r.commit.clone())
+                    .unwrap_or_default();
+
+                GitReference {
+                    name: ref_name,
+                    commit,
+                }
+            })
+            .collect()
+    } else {
+        all_refs
+            .into_iter()
+            .map(|r| GitReference {
+                // must use the ref name without `ref/heads` prefix
+                name: r.name,
+                commit: r.commit,
+            })
+            .collect()
+    };
+
     ProvidedRepository {
         id: id.clone(),
         integration_id: value.integration_id.as_id(),
@@ -290,14 +352,7 @@ fn to_provided_repository(value: ProvidedRepositoryDAO, job_info: JobInfo) -> Pr
         vendor_id: value.vendor_id,
         created_at: value.created_at,
         updated_at: value.updated_at,
-        refs: tabby_git::list_refs(&RepositoryConfig::resolve_dir(&value.git_url))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|r| GitReference {
-                name: r.name,
-                commit: r.commit,
-            })
-            .collect(),
+        refs,
         git_url: value.git_url,
         job_info,
     }
@@ -413,7 +468,7 @@ mod tests {
 
         // Test toggling active status
         repository
-            .update_repository_active(repo_id, true)
+            .update_repository_active(repo_id, true, None)
             .await
             .unwrap();
 
@@ -458,7 +513,7 @@ mod tests {
             .clone();
 
         repository
-            .update_repository_active(repo_id.clone(), true)
+            .update_repository_active(repo_id.clone(), true, None)
             .await
             .unwrap();
 
@@ -477,7 +532,7 @@ mod tests {
         );
 
         repository
-            .update_repository_active(repo_id, false)
+            .update_repository_active(repo_id, false, None)
             .await
             .unwrap();
 
@@ -518,7 +573,7 @@ mod tests {
             .clone();
 
         repository
-            .update_repository_active(repo_id, true)
+            .update_repository_active(repo_id, true, None)
             .await
             .unwrap();
 
@@ -580,7 +635,7 @@ mod tests {
             },
         ];
 
-        let provider = integration.get_integration(provider_id).await.unwrap();
+        let provider = integration.get_integration(&provider_id).await.unwrap();
         refresh_repositories_for_provider(&*repository, &*integration, provider, new_repos)
             .await
             .unwrap();
@@ -631,7 +686,7 @@ mod tests {
             .unwrap();
 
         repository
-            .update_repository_active(repo_id1, true)
+            .update_repository_active(repo_id1, true, None)
             .await
             .unwrap();
 
@@ -646,7 +701,7 @@ mod tests {
             .unwrap();
 
         repository
-            .update_repository_active(repo_id2, true)
+            .update_repository_active(repo_id2, true, None)
             .await
             .unwrap();
 

@@ -6,16 +6,12 @@ import org.eclipse.jface.preference.FieldEditorPreferencePage;
 import org.eclipse.jface.preference.PreferenceDialog;
 import org.eclipse.jface.preference.StringFieldEditor;
 import org.eclipse.swt.SWT;
-import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Group;
 import org.eclipse.swt.widgets.Label;
 import org.eclipse.ui.IWorkbench;
-import org.eclipse.ui.IWorkbenchPage;
 import org.eclipse.ui.IWorkbenchPreferencePage;
-import org.eclipse.ui.IWorkbenchWindow;
-import org.eclipse.ui.PartInitException;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.dialogs.PreferencesUtil;
 
@@ -67,7 +63,7 @@ public class MainPreferencesPage extends FieldEditorPreferencePage implements IW
 
 		Label tip = new Label(grid, SWT.WRAP);
 		tip.setText(
-				"Note: If leave empty, server endpoint config in `~/.tabby-client/agent/config.toml` will be used.");
+				"Note: If left empty, the server endpoint config in `~/.tabby-client/agent/config.toml` will be used.");
 		GridDataFactory.fillDefaults().indent(10, 2).span(2, 1).applyTo(tip);
 	}
 

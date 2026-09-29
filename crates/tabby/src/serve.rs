@@ -10,7 +10,9 @@ use tabby_common::{
     config::{Config, ModelConfig},
     usage,
 };
-use tabby_inference::ChatCompletionStream;
+use tabby_download::ModelKind;
+#[cfg(feature = "ee")]
+use tabby_webserver::EEApiDoc;
 use tokio::{sync::oneshot::Sender, time::sleep};
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, warn};
@@ -21,7 +23,7 @@ use utoipa::{
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::{
-    routes::{self, run_app},
+    routes::{self, run_app, ChatState},
     services::{
         self,
         code::create_code_search,
@@ -52,14 +54,14 @@ Install following IDE / Editor extensions to get started with [Tabby](https://gi
     servers(
         (url = "/", description = "Server"),
     ),
-    paths(routes::log_event, routes::completions, routes::chat_completions_utoipa, routes::health, routes::setting),
+    paths(
+        routes::log_event,
+        routes::completions,
+        routes::chat_completions_utoipa,
+        routes::health,
+        routes::setting,
+    ),
     components(schemas(
-        api::code::CodeSearchHit,
-        api::code::CodeSearchQuery,
-        api::code::CodeSearchScores,
-        api::code::CodeSearchDocument,
-        api::doc::DocSearchHit,
-        api::doc::DocSearchDocument,
         api::event::LogEventRequest,
         completion::CompletionRequest,
         completion::CompletionResponse,
@@ -69,6 +71,7 @@ Install following IDE / Editor extensions to get started with [Tabby](https://gi
         completion::Snippet,
         completion::DebugOptions,
         completion::DebugData,
+        completion::EditHistory,
         health::HealthState,
         health::Version,
         api::server_setting::ServerSetting,
@@ -108,11 +111,6 @@ pub struct ServeArgs {
 
     #[cfg(feature = "ee")]
     #[clap(hide = true, long, default_value_t = false)]
-    #[deprecated(since = "0.11.0", note = "webserver is enabled by default")]
-    webserver: bool,
-
-    #[cfg(feature = "ee")]
-    #[clap(hide = true, long, default_value_t = false)]
     no_webserver: bool,
 }
 
@@ -123,12 +121,6 @@ pub async fn main(config: &Config, args: &ServeArgs) {
 
     let tx = try_run_spinner();
 
-    #[cfg(feature = "ee")]
-    #[allow(deprecated)]
-    if args.webserver {
-        warn!("'--webserver' is enabled by default since 0.11, and will be removed in the next major release. Please remove this flag from your command.");
-    }
-
     #[allow(unused_assignments)]
     let mut webserver = None;
 
@@ -137,7 +129,11 @@ pub async fn main(config: &Config, args: &ServeArgs) {
         webserver = Some(!args.no_webserver)
     }
 
-    let embedding = embedding::create(&config.model.embedding).await;
+    let embedding = if tabby_common::config::is_embedding_service_enabled() {
+        embedding::create(&config.model.embedding).await
+    } else {
+        None
+    };
 
     #[cfg(feature = "ee")]
     let ws = if !args.no_webserver {
@@ -155,19 +151,30 @@ pub async fn main(config: &Config, args: &ServeArgs) {
         logger = ws.logger();
     }
 
-    let index_reader_provider = Arc::new(IndexReaderProvider::default());
-    let docsearch = Arc::new(services::doc::create(
-        embedding.clone(),
-        index_reader_provider.clone(),
-    ));
+    let index_reader_provider = embedding
+        .is_some()
+        .then(|| Arc::new(IndexReaderProvider::default()));
 
-    let code = Arc::new(create_code_search(
-        embedding.clone(),
-        index_reader_provider.clone(),
-    ));
+    let docsearch = embedding.clone().zip(index_reader_provider.clone()).map(
+        |(embedding, index_reader_provider)| {
+            Arc::new(services::structured_doc::create(
+                embedding.clone(),
+                index_reader_provider.clone(),
+            )) as Arc<dyn services::structured_doc::DocSearch>
+        },
+    );
+
+    let code = embedding
+        .zip(index_reader_provider)
+        .map(|(embedding, index_reader_provider)| {
+            Arc::new(create_code_search(
+                embedding.clone(),
+                index_reader_provider.clone(),
+            )) as Arc<dyn CodeSearch>
+        });
 
     let model = &config.model;
-    let (completion, chat) = create_completion_service_and_chat(
+    let (completion, completion_stream, chat) = create_completion_service_and_chat(
         &config.completion,
         code.clone(),
         logger.clone(),
@@ -176,26 +183,42 @@ pub async fn main(config: &Config, args: &ServeArgs) {
     )
     .await;
 
+    let chat_state = chat.as_ref().map(|c| {
+        Arc::new(ChatState {
+            chat_completion: c.clone(),
+            logger: logger.clone(),
+        })
+    });
     let mut api = api_router(
         args,
         &config,
         logger.clone(),
         code.clone(),
         completion,
-        chat.clone(),
+        chat_state,
         webserver,
     )
     .await;
+    let mut doc = ApiDoc::openapi();
+    #[cfg(feature = "ee")]
+    doc.merge(EEApiDoc::openapi());
     let mut ui = Router::new()
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", doc))
         .fallback(|| async { axum::response::Redirect::temporary("/swagger-ui") });
 
     #[cfg(feature = "ee")]
     if let Some(ws) = &ws {
         let (new_api, new_ui) = ws
-            .attach(&config, api, ui, code, chat, docsearch, |x| {
-                Box::new(services::doc::create_serper(x))
-            })
+            .attach(
+                &config,
+                api,
+                ui,
+                code,
+                chat,
+                completion_stream,
+                docsearch,
+                |x| Box::new(services::structured_doc::create_serper(x)),
+            )
             .await;
         api = new_api;
         ui = new_ui;
@@ -211,15 +234,17 @@ pub async fn main(config: &Config, args: &ServeArgs) {
 
 async fn load_model(config: &Config) {
     if let Some(ModelConfig::Local(ref model)) = config.model.completion {
-        download_model_if_needed(&model.model_id).await;
+        download_model_if_needed(&model.model_id, ModelKind::Completion).await;
     }
 
     if let Some(ModelConfig::Local(ref model)) = config.model.chat {
-        download_model_if_needed(&model.model_id).await;
+        download_model_if_needed(&model.model_id, ModelKind::Chat).await;
     }
 
-    if let ModelConfig::Local(ref model) = config.model.embedding {
-        download_model_if_needed(&model.model_id).await;
+    if tabby_common::config::is_embedding_service_enabled() {
+        if let ModelConfig::Local(ref model) = config.model.embedding {
+            download_model_if_needed(&model.model_id, ModelKind::Embedding).await;
+        }
     }
 }
 
@@ -227,9 +252,9 @@ async fn api_router(
     args: &ServeArgs,
     config: &Config,
     logger: Arc<dyn EventLogger>,
-    _code: Arc<dyn CodeSearch>,
+    _code: Option<Arc<dyn CodeSearch>>,
     completion_state: Option<CompletionService>,
-    chat_state: Option<Arc<dyn ChatCompletionStream>>,
+    chat_state: Option<Arc<ChatState>>,
     webserver: Option<bool>,
 ) -> Router {
     let mut routers = vec![];

@@ -3,11 +3,11 @@
   "publisher": "TabbyML",
   "displayName": "Tabby",
   "description": "Tabby is a self-hosted AI coding assistant that can suggest multi-line code or full functions in real-time.",
-  "homepage": "https://tabby.tabbyml.com/",
+  "homepage": "https://www.tabbyml.com/",
   "repository": "https://github.com/TabbyML/tabby",
   "bugs": "https://github.com/TabbyML/tabby/issues",
   "license": "Apache-2.0",
-  "version": "1.13.0-dev",
+  "version": "1.27.0-dev",
   "keywords": [
     "ai",
     "autocomplete",
@@ -45,13 +45,13 @@
         "category": "Tabby"
       },
       {
-        "command": "tabby.setApiEndpoint",
+        "command": "tabby.connectToServer",
         "title": "Connect to Server...",
         "category": "Tabby"
       },
       {
-        "command": "tabby.setApiToken",
-        "title": "Set Token...",
+        "command": "tabby.updateToken",
+        "title": "Update Token...",
         "category": "Tabby"
       },
       {
@@ -75,8 +75,8 @@
         "category": "Tabby"
       },
       {
-        "command": "tabby.notifications.resetMuted",
-        "title": "Reset notifications marked as \"Don't Show Again\"",
+        "command": "tabby.status.resetIgnoredIssues",
+        "title": "Reset Ignored Issues",
         "category": "Tabby"
       },
       {
@@ -100,6 +100,11 @@
         "category": "Tabby"
       },
       {
+        "command": "tabby.chat.codeReviewCodeBlock",
+        "title": "Code Review",
+        "category": "Tabby"
+      },
+      {
         "command": "tabby.chat.generateCodeBlockDoc",
         "title": "Generate Docs",
         "category": "Tabby"
@@ -114,6 +119,12 @@
         "title": "Generate Commit Message",
         "category": "Tabby",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "tabby.chat.generateBranchName",
+        "title": "Create Branch with Suggestions",
+        "category": "Tabby",
+        "icon": "$(git-branch)"
       },
       {
         "command": "tabby.chat.edit.start",
@@ -136,13 +147,37 @@
         "category": "Tabby"
       },
       {
-        "command": "tabby.server.selectPastServerConfig",
-        "title": "Select Server Endpoint from History",
+        "command": "tabby.chat.createPanel",
+        "title": "Open Chat in Editor",
         "category": "Tabby"
       },
       {
-        "command": "tabby.chat.createPanel",
-        "title": "Open Chat in Editor",
+        "command": "tabby.chat.navigate.newChat",
+        "title": "New Chat",
+        "icon": "$(add)",
+        "enablement": "tabby.chatSidePanelStatus === 'ready'",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.chat.navigate.history",
+        "title": "Chat History",
+        "icon": "$(history)",
+        "enablement": "tabby.chatSidePanelStatus === 'ready'",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.toggleLanguageInlineCompletion",
+        "title": "Enable/Disable Inline Completion for Current Language",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.terminal.explainSelection",
+        "title": "Explain",
+        "category": "Tabby"
+      },
+      {
+        "command": "tabby.terminal.addSelectionToChat",
+        "title": "Add Selection to Chat",
         "category": "Tabby"
       }
     ],
@@ -150,25 +185,58 @@
       {
         "id": "tabby.submenu",
         "label": "Tabby"
+      },
+      {
+        "id": "tabby.terminal.submenu",
+        "label": "Tabby"
       }
     ],
     "menus": {
       "tabby.submenu": [
         {
+          "command": "tabby.chat.edit.start",
+          "when": "tabby.chatEnabled",
+          "group": "tabby.submenu.0edit@1"
+        },
+        {
+          "command": "tabby.chat.explainCodeBlock",
+          "when": "editorHasSelection && tabby.chatEnabled",
+          "group": "tabby.submenu.1edit@1"
+        },
+        {
+          "command": "tabby.chat.codeReviewCodeBlock",
+          "when": "editorHasSelection && tabby.chatEnabled",
+          "group": "tabby.submenu.1edit@2"
+        },
+        {
           "command": "tabby.chat.addRelevantContext",
           "when": "editorHasSelection && tabby.chatEnabled",
-          "group": "tabby.submenu@1"
+          "group": "tabby.submenu.2chat@1"
         },
         {
           "command": "tabby.chat.addFileContext",
           "when": "tabby.chatEnabled",
-          "group": "tabby.submenu@2"
+          "group": "tabby.submenu.2chat@2"
+        }
+      ],
+      "tabby.terminal.submenu": [
+        {
+          "command": "tabby.terminal.explainSelection",
+          "group": "tabby.terminal.action"
+        },
+        {
+          "command": "tabby.terminal.addSelectionToChat",
+          "group": "tabby.terminal.context"
         }
       ],
       "commandPalette": [
         {
           "command": "tabby.inlineCompletion.trigger",
           "when": "tabby.inlineCompletionTriggerMode === 'manual' && !editorHasSelection && !inlineSuggestionsVisible"
+        },
+        {
+          "command": "tabby.updateToken",
+          "when": "tabby.status === 'unauthorized'"
         },
         {
           "command": "tabby.openTabbyAgentSettings",
@@ -192,7 +260,11 @@
         },
         {
           "command": "tabby.chat.generateCommitMessage",
-          "when": "false"
+          "when": "tabby.chatEnabled"
+        },
+        {
+          "command": "tabby.chat.generateBranchName",
+          "when": "tabby.chatEnabled"
         },
         {
           "command": "tabby.chat.edit.start",
@@ -226,8 +298,26 @@
       ],
       "view/title": [
         {
+          "command": "tabby.chat.navigate.newChat",
+          "when": "view == tabby.chatView",
+          "group": "navigation@0"
+        },
+        {
+          "command": "tabby.chat.navigate.history",
+          "when": "view == tabby.chatView",
+          "group": "navigation@1"
+        },
+        {
           "command": "tabby.chat.createPanel",
-          "when": "view == tabby.chatView"
+          "when": "view == tabby.chatView",
+          "group": "0_new"
+        }
+      ],
+      "terminal/context": [
+        {
+          "submenu": "tabby.terminal.submenu",
+          "group": "2_tabby",
+          "when": "tabby.terminalContextEnabled"
         }
       ]
     },
@@ -248,7 +338,7 @@
           {
             "id": "connectToServer",
             "title": "Connect to Server",
-            "description": "Connect the Tabby extension to your server. \n[Connect to Server](command:tabby.setApiEndpoint)",
+            "description": "Connect the Tabby extension to your server. \n[Connect to Server](command:tabby.connectToServer)",
             "media": {
               "markdown": "assets/walkthroughs/connectToServer.md"
             }
@@ -272,7 +362,7 @@
           {
             "id": "commands",
             "title": "Commands",
-            "description": "Explore all Tabby commands. \n[Tabby commands](command:workbench.action.quickOpen?%5B%22%3ETabby%22%5D)",
+            "description": "Explore all [Tabby Commands](command:workbench.action.quickOpen?%5B%22%3ETabby%22%5D). \n[Tabby Command Palette](command:tabby.commandPalette.trigger)",
             "media": {
               "markdown": "assets/walkthroughs/commands.md"
             }
@@ -294,10 +384,10 @@
         "properties": {
           "tabby.endpoint": {
             "type": "string",
-            "default": "",
+            "default": "http://localhost:8080",
             "pattern": "(^$)|(^https?:\\/\\/\\S+$)",
-            "patternErrorMessage": "Please enter a validate http or https URL.",
-            "markdownDescription": "Specify the API endpoint for the Tabby server.  \nIf authentication is required, please [Set Credentials](command:tabby.setApiToken).  \nIf left empty, the server endpoint specified in the [Tabby Agent Settings](command:tabby.openTabbyAgentSettings) will be used."
+            "patternErrorMessage": "Please enter a valid HTTP or HTTPS URL.",
+            "markdownDescription": "Please use the command [Connect to Server](command:tabby.connectToServer) to specify the endpoint of the Tabby server."
           },
           "tabby.keybindings": {
             "type": "string",
@@ -328,6 +418,14 @@
                   "Automatic trigger when you stop typing",
                   "Manual trigger by pressing `Alt + \\`"
                 ]
+              },
+              "inlineCompletion.disabledLanguages": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "List of language IDs for which code completion should be disabled. Use the 'Toggle Single Language Inline Completion' command to easily enable or disable completion for the current language."
               },
               "chatEdit.history": {
                 "type": "integer",
@@ -393,30 +491,24 @@
         "command": "tabby.chat.edit.accept",
         "key": "ctrl+enter",
         "mac": "cmd+enter",
-        "when": "tabby.chatEditResolving && editorTextFocus && !editorReadonly"
+        "when": "tabby.chatEditResolving && !tabby.chatEditInProgress && editorTextFocus && !editorReadonly"
       },
       {
         "command": "tabby.chat.edit.discard",
         "key": "escape",
-        "when": "tabby.chatEditResolving && editorTextFocus && !editorReadonly"
+        "when": "tabby.chatEditResolving && !tabby.chatEditInProgress && editorTextFocus && !editorReadonly"
       },
       {
         "command": "tabby.chat.addRelevantContext",
         "key": "ctrl+l",
         "mac": "cmd+l",
-        "when": "editorHasSelection && editorTextFocus && tabby.chatEnabled"
+        "when": "tabby.chatEnabled && editorTextFocus && editorHasSelection && tabby.chatSidePanelVisible"
       },
       {
-        "command": "tabby.chatView.focus",
+        "command": "tabby.chat.toggleFocus",
         "key": "ctrl+l",
         "mac": "cmd+l",
-        "when": "!editorHasSelection && editorTextFocus && tabby.chatEnabled"
-      },
-      {
-        "command": "workbench.action.focusActiveEditorGroup",
-        "key": "ctrl+l",
-        "mac": "cmd+l",
-        "when": "!editorFocus && focusedView == 'tabby.chatView'"
+        "when": "(tabby.chatEnabled && editorTextFocus && !tabby.chatSidePanelVisible) || ((!editorTextFocus || (editorTextFocus && !editorHasSelection)) && tabby.chatSidePanelVisible)"
       }
     ],
     "viewsContainers": {
@@ -441,10 +533,10 @@
   },
   "scripts": {
     "build": "tsc -p ./tsconfig.build.json --noEmit && tsup --minify",
-    "watch": "tsc-watch --noEmit --onSuccess \"tsup\"",
-    "dev": "code --extensionDevelopmentPath=$PWD --disable-extensions && pnpm watch",
-    "vscode:dev": "pnpm run dev",
-    "dev:browser": "vscode-test-web --extensionDevelopmentPath=$PWD --browserType=chromium --port=3000 && pnpm watch",
+    "watch": "tsup --watch",
+    "vscode:dev": "pnpm run dev:vscode",
+    "dev:vscode": "pnpm run watch --platform node --env.LAUNCH_ON_SUCCESS 1",
+    "dev:browser": "pnpm run watch --platform browser --env.LAUNCH_ON_SUCCESS 1",
     "lint": "eslint --ext .ts ./src && prettier --check .",
     "lint:fix": "eslint --fix --ext .ts ./src && prettier --write .",
     "vscode:prepackage": "turbo build --force",
@@ -456,23 +548,29 @@
     "ovsx:publish-prerelease": "ovsx publish --no-dependencies --pre-release --pat $OVSX_PAT",
     "package": "pnpm run vscode:package",
     "publish": "pnpm run vscode:publish && pnpm run ovsx:publish",
-    "publish-prerelease": "pnpm run vscode:publish-prerelease && pnpm run ovsx:publish-prerelease"
+    "publish-prerelease": "pnpm run vscode:publish-prerelease && pnpm run ovsx:publish-prerelease",
+    "test": "mocha"
   },
   "devDependencies": {
-    "@quilted/threads": "^2.2.0",
+    "@types/dedent": "^0.7.2",
+    "@types/chai": "^4.3.5",
     "@types/deep-equal": "^1.0.4",
     "@types/diff": "^5.2.1",
+    "@types/fs-extra": "^11.0.1",
     "@types/mocha": "^10.0.1",
     "@types/node": "18.x",
     "@types/object-hash": "^3.0.0",
     "@types/semver": "^7.5.8",
+    "@types/uuid": "^9.0.0",
     "@types/vscode": "^1.82.0",
     "@typescript-eslint/eslint-plugin": "^6.13.1",
     "@typescript-eslint/parser": "^6.13.1",
     "@vscode/test-electron": "^2.1.5",
-    "@vscode/test-web": "^0.0.44",
+    "@vscode/test-web": "^0.0.63",
     "@vscode/vsce": "^2.15.0",
     "assert": "^2.0.0",
+    "debounce": "^2.2.0",
+    "chai": "^4.3.11",
     "dedent": "^0.7.0",
     "deep-equal": "^2.2.1",
     "diff": "^5.2.0",
@@ -480,16 +578,20 @@
     "esbuild-plugin-polyfill-node": "^0.3.0",
     "eslint": "^8.55.0",
     "eslint-config-prettier": "^9.0.0",
+    "fs-extra": "^11.1.1",
     "get-installed-path": "^4.0.8",
+    "mocha": "^10.2.0",
     "object-hash": "^3.0.0",
     "ovsx": "^0.9.5",
     "prettier": "^3.0.0",
     "semver": "^7.6.0",
     "tabby-agent": "workspace:*",
     "tabby-chat-panel": "workspace:*",
+    "tabby-threads": "workspace:*",
     "tsc-watch": "^6.2.0",
     "tsup": "^8.0.2",
     "typescript": "^5.3.2",
+    "uuid": "^9.0.0",
     "vscode-languageclient": "^9.0.1"
   }
 }

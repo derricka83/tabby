@@ -1,3 +1,4 @@
+mod otel;
 mod routes;
 mod services;
 
@@ -9,8 +10,6 @@ use std::os::unix::fs::PermissionsExt;
 
 use clap::{Parser, Subcommand};
 use tabby_common::config::{Config, ModelConfig};
-use tracing::level_filters::LevelFilter;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -56,7 +55,7 @@ async fn main() {
     color_eyre::install().expect("Must be able to install color_eyre");
 
     let cli = Cli::parse();
-    init_logging();
+    let _guard = otel::init_tracing_subscriber(cli.otlp_endpoint);
 
     let config = Config::load().expect("Must be able to load config");
     let root = tabby_common::path::tabby_root();
@@ -91,36 +90,6 @@ macro_rules! fatal {
     };
 }
 
-fn init_logging() {
-    let mut layers = Vec::new();
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_file(true)
-        .with_line_number(true)
-        .boxed();
-
-    layers.push(fmt_layer);
-
-    let mut dirs = if cfg!(feature = "prod") {
-        "tabby=info,otel=debug,http_api_bindings=info,llama_cpp_server=info".into()
-    } else {
-        "tabby=debug,otel=debug,http_api_bindings=debug,llama_cpp_server=debug".into()
-    };
-
-    if let Ok(env) = std::env::var(EnvFilter::DEFAULT_ENV) {
-        dirs = format!("{dirs},{env}")
-    };
-
-    let env_filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::WARN.into())
-        .parse_lossy(dirs);
-
-    tracing_subscriber::registry()
-        .with(layers)
-        .with(env_filter)
-        .init();
-}
-
 fn to_local_config(model: &str, parallelism: u8, device: &Device) -> ModelConfig {
     let num_gpu_layers = if *device != Device::Cpu {
         std::env::var("LLAMA_CPP_N_GPU_LAYERS")
@@ -131,6 +100,8 @@ fn to_local_config(model: &str, parallelism: u8, device: &Device) -> ModelConfig
     } else {
         0
     };
+    // This only works when the the model is included in cli arguments.
+    let enable_fast_attention = Some(std::env::var("LLAMA_CPP_FAST_ATTENTION").is_ok());
 
-    ModelConfig::new_local(model, parallelism, num_gpu_layers)
+    ModelConfig::new_local(model, parallelism, num_gpu_layers, enable_fast_attention)
 }

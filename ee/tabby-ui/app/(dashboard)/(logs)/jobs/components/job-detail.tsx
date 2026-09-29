@@ -1,12 +1,15 @@
 'use client'
 
-import React from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Ansi from '@curvenote/ansi-to-react'
 import humanizerDuration from 'humanize-duration'
+import { concat, sortBy, unionWith } from 'lodash-es'
 import moment from 'moment'
+import useSWR from 'swr'
 import { useQuery } from 'urql'
 
+import fetcher from '@/lib/tabby/fetcher'
 import { listJobRuns } from '@/lib/tabby/query'
 import { cn } from '@/lib/utils'
 import {
@@ -16,32 +19,135 @@ import {
   IconSpinner,
   IconStopWatch
 } from '@/components/ui/icons'
+import { LoadMoreIndicator } from '@/components/load-more-indicator'
 import { ListSkeleton } from '@/components/skeleton'
 
 import { getJobDisplayName, getLabelByJobRun } from '../utils'
+
+interface LogChunk {
+  startByte: number
+  endByte: number
+  logs: string
+}
+
+const CHUNK_SIZE = 20 * 1000
 
 export default function JobRunDetail() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const id = searchParams.get('id')
-  const [{ data, error, fetching }, reexecuteQuery] = useQuery({
+  const [chunks, setChunks] = useState<LogChunk[]>([])
+  const cursor = useRef<number>(0)
+  const totalBytes = useRef<number>(0)
+  const [startBytes, setStartBytes] = useState(-1)
+  const fetchLogEndPoint = id ? `/background-jobs/${id}/logs` : null
+  const [{ data, fetching: fetchingJobNode }, reexecuteQuery] = useQuery({
     query: listJobRuns,
     variables: { ids: [id as string] },
     pause: !id
   })
-
   const currentNode = data?.jobRuns?.edges?.[0]?.node
+  const shouldFetchLogs = !!id && !fetchingJobNode && !currentNode?.stdout
+  const {
+    data: logsData,
+    mutate,
+    isLoading: isLoadingLogs,
+    isValidating: isValidatingLogs
+  } = useSWR(
+    fetchLogEndPoint ? [fetchLogEndPoint, startBytes + 1] : null,
+    ([url, start]) => {
+      return fetcher(url, {
+        headers: {
+          Range: `bytes=${start}-${start + CHUNK_SIZE}`
+        },
+        responseFormatter: res => {
+          const contentRange = res.headers.get('Content-Range')
+          if (!contentRange) return null
+          if (res.status === 206) {
+            const [range, total] = contentRange
+              .replace(/^bytes\s/, '')
+              .split('/')
+            const [start, end] = range?.split('-')
+            cursor.current = parseInt(end)
+            return res.text().then(text => ({
+              logs: text,
+              totalBytes: parseInt(total),
+              startByte: parseInt(start),
+              endByte: parseInt(end)
+            }))
+          }
+        },
+        errorHandler: response => {
+          throw new Error(response?.statusText.toString())
+        }
+      })
+    },
+    {
+      errorRetryCount: 1
+    }
+  )
+
+  const isFetchingLogs = isLoadingLogs || isValidatingLogs
+
+  // join logs
+  useEffect(() => {
+    if (logsData) {
+      const newChunk: LogChunk = {
+        startByte: logsData.startByte,
+        endByte: logsData.endByte,
+        logs: logsData.logs
+      }
+      setChunks(prev => {
+        return sortBy(
+          unionWith(concat([newChunk], prev), (x, y) => {
+            return x.startByte === y.startByte
+          }),
+          'startByte'
+        )
+      })
+      totalBytes.current = logsData?.totalBytes ?? 0
+      // setTotalBytes(logsData?.totalBytes ?? 0)
+    }
+  }, [logsData])
+
+  const finalLogs = useMemo(() => {
+    if (currentNode?.stdout) return currentNode?.stdout
+    const logs = chunks.reduce((sum, cur) => sum + cur.logs, '')
+    return processPartialLine(logs)
+  }, [currentNode?.stdout, chunks])
 
   const stateLabel = getLabelByJobRun(currentNode)
   const isPending =
-    (stateLabel === 'Pending' || stateLabel === 'Running') &&
-    !currentNode?.stdout
+    (stateLabel === 'Pending' || stateLabel === 'Running') && !finalLogs
+
+  const isLoadedCompleted =
+    !!totalBytes.current &&
+    chunks[chunks.length - 1]?.endByte >= totalBytes.current - 1
+
+  const handleBackNavigation = () => {
+    if (typeof window !== 'undefined' && window.history.length <= 1) {
+      router.push('/jobs')
+    } else {
+      router.back()
+    }
+  }
+
+  const handleLoadMore = () => {
+    if (isFetchingLogs) return
+    if (cursor.current && cursor.current + 1 < totalBytes.current) {
+      const nextCursor = cursor.current
+      setStartBytes(nextCursor)
+    }
+  }
 
   React.useEffect(() => {
     let timer: number
     if (currentNode?.createdAt && !currentNode?.finishedAt) {
       timer = window.setTimeout(() => {
         reexecuteQuery()
+        if (!isFetchingLogs && (isLoadedCompleted || !chunks.length)) {
+          mutate()
+        }
       }, 5000)
     }
 
@@ -50,18 +156,18 @@ export default function JobRunDetail() {
         clearInterval(timer)
       }
     }
-  }, [currentNode])
+  }, [currentNode, isLoadedCompleted, chunks?.length])
 
   return (
     <>
-      {fetching ? (
+      {fetchingJobNode ? (
         <ListSkeleton />
       ) : (
         <div className="flex flex-1 flex-col items-stretch gap-2">
           {currentNode && (
             <>
               <div
-                onClick={() => router.back()}
+                onClick={handleBackNavigation}
                 className="-ml-1 flex cursor-pointer items-center transition-opacity hover:opacity-60"
               >
                 <IconChevronLeft className="mr-1 h-6 w-6" />
@@ -114,7 +220,24 @@ export default function JobRunDetail() {
                 )}
               </div>
               <div className="flex flex-1 flex-col">
-                <StdoutView value={currentNode?.stdout} pending={isPending} />
+                <StdoutView value={finalLogs} pending={isPending}>
+                  {shouldFetchLogs && !isLoadedCompleted && (
+                    <LoadMoreIndicator
+                      intersectionOptions={{
+                        trackVisibility: true,
+                        delay: 100,
+                        rootMargin: '200px 0px 0px 0px'
+                      }}
+                      itemCount={chunks.length}
+                      onLoad={handleLoadMore}
+                      isFetching={isFetchingLogs}
+                    >
+                      <div className="my-8 flex justify-center">
+                        <IconSpinner />
+                      </div>
+                    </LoadMoreIndicator>
+                  )}
+                </StdoutView>
               </div>
             </>
           )}
@@ -147,11 +270,24 @@ function StdoutView({
           <IconSpinner className="h-8 w-8" />
         </div>
       )}
-      {value && (
-        <pre className="whitespace-pre-wrap p-4">
-          <Ansi>{value}</Ansi>
-        </pre>
+      {!!value && (
+        <>
+          <pre className="whitespace-pre-wrap p-4">
+            <Ansi>{value}</Ansi>
+          </pre>
+          {children}
+        </>
       )}
     </div>
   )
+}
+
+function processPartialLine(logs: string) {
+  if (!logs) return logs
+
+  const lines = logs.split('\n')
+  const lastLine = lines[lines.length - 1]
+  const hasLineBreak = lastLine.endsWith('\n')
+
+  return hasLineBreak ? lines.join('\n') : lines.slice(0, -1).join('\n')
 }

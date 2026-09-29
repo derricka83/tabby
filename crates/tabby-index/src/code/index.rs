@@ -1,18 +1,22 @@
-use std::{pin::pin, sync::Arc};
+use std::{path::Path, pin::pin, sync::Arc};
 
+use anyhow::Result;
 use async_stream::stream;
 use futures::StreamExt;
 use ignore::{DirEntry, Walk};
-use tabby_common::index::corpus;
+use tabby_common::index::{code, corpus};
 use tabby_inference::Embedding;
 use tracing::warn;
 
 use super::{
     create_code_builder,
     intelligence::{CodeIntelligence, SourceCode},
-    CodeRepository,
+    repository, CodeRepository,
 };
-use crate::indexer::Indexer;
+use crate::{
+    code::repository::resolve_commits,
+    indexer::{Indexer, TantivyDocBuilder},
+};
 
 // Magic numbers
 static MAX_LINE_LENGTH_THRESHOLD: usize = 300;
@@ -22,8 +26,29 @@ static MAX_NUMBER_OF_LINES: usize = 100000;
 static MAX_NUMBER_FRACTION: f32 = 0.5f32;
 
 pub async fn index_repository(embedding: Arc<dyn Embedding>, repository: &CodeRepository) {
-    let total_files = Walk::new(repository.dir()).count();
-    let file_stream = stream! {
+    let refs = resolve_commits(repository);
+    // resolve_commits would return the current default branch,
+    // so it should never be empty here.
+    if refs.is_empty() {
+        logkit::error!(
+            "no branches found for repository {}",
+            repository.canonical_git_url()
+        );
+        return;
+    }
+
+    let mut count_files = 0;
+    let mut count_chunks = 0;
+
+    for (ref_name, sha) in refs {
+        if let Err(e) = repository::checkout(repository, &ref_name) {
+            warn!("Failed to checkout ref {}: {}", ref_name, e);
+            continue;
+        }
+
+        logkit::info!("Indexing branch {} with commit {}", ref_name, &sha);
+
+        let file_stream = stream! {
         for file in Walk::new(repository.dir()) {
             let file = match file {
                 Ok(file) => file,
@@ -35,28 +60,29 @@ pub async fn index_repository(embedding: Arc<dyn Embedding>, repository: &CodeRe
 
             yield file;
         }
-    }
-    // Commit every 100 files
-    .chunks(100);
+        }
+        // Commit every 100 files
+        .chunks(100);
 
-    let mut file_stream = pin!(file_stream);
+        let mut file_stream = pin!(file_stream);
 
-    let mut count_files = 0;
-    let mut count_chunks = 0;
-    while let Some(files) = file_stream.next().await {
-        count_files += files.len();
-        count_chunks += add_changed_documents(repository, embedding.clone(), files).await;
-        logkit::info!("Processed {count_files}/{total_files} files, updated {count_chunks} chunks",);
+        while let Some(files) = file_stream.next().await {
+            count_files += files.len();
+            count_chunks += add_changed_documents(repository, &sha, embedding.clone(), files).await;
+            logkit::info!("Processed {count_files} files, updated {count_chunks} chunks",);
+        }
     }
 }
 
+// garbage collection use blob id to check files,
+// does NOT have to checkout branch locally.
 pub async fn garbage_collection() {
     let index = Indexer::new(corpus::CODE);
     stream! {
         let mut num_to_keep = 0;
         let mut num_to_delete = 0;
 
-        for await id in index.iter_ids() {
+        for await (_, id) in index.iter_ids() {
             let Some(source_file_id) = SourceCode::source_file_id_from_id(&id) else {
                 warn!("Failed to extract source file id from index id: {id}");
                 num_to_delete += 1;
@@ -79,6 +105,7 @@ pub async fn garbage_collection() {
 
 async fn add_changed_documents(
     repository: &CodeRepository,
+    commit: &str,
     embedding: Arc<dyn Embedding>,
     files: Vec<DirEntry>,
 ) -> usize {
@@ -96,12 +123,23 @@ async fn add_changed_documents(
 
             let id = SourceCode::to_index_id(&repository.source_id, &key).id;
 
-            if cloned_index.is_indexed(&id) {
-                // Skip if already indexed
+            // Skip if already indexed and has no failed chunks,
+            // when skip, we should check if the document needs to be backfilled.
+            if !require_updates(cloned_index.clone(), &id) {
+                backfill_commit_in_doc_if_needed(
+                    builder.clone(),
+                    cloned_index.clone(),
+                    &id,
+                    repository,
+                    commit,
+                    file.path()).await.unwrap_or_else(|e| {
+                        warn!("Failed to backfill commit for {id}: {e}");
+                    }
+                );
                 continue;
             }
 
-            let Some(code) = CodeIntelligence::compute_source_file(repository, file.path()) else {
+            let Some(code) = CodeIntelligence::compute_source_file(repository, commit, file.path()) else {
                 continue;
             };
 
@@ -110,6 +148,8 @@ async fn add_changed_documents(
             }
 
             let (_, s) = builder.build(code).await;
+            // must delete before adding, otherwise the some fields like failed_chunks_count will remain
+            cloned_index.delete(&id);
             for await task in s {
                 yield task;
             }
@@ -131,6 +171,42 @@ async fn add_changed_documents(
     };
 
     count_docs
+}
+
+fn require_updates(indexer: Arc<Indexer>, id: &str) -> bool {
+    if indexer.is_indexed(id) && !indexer.has_failed_chunks(id) {
+        return false;
+    };
+
+    true
+}
+
+// v0.23.0 add the commit field to the code document.
+async fn backfill_commit_in_doc_if_needed(
+    builder: Arc<TantivyDocBuilder<SourceCode>>,
+    indexer: Arc<Indexer>,
+    id: &str,
+    repository: &CodeRepository,
+    commit: &str,
+    path: &Path,
+) -> Result<()> {
+    if indexer.has_attribute_field(id, code::fields::COMMIT) {
+        return Ok(());
+    }
+
+    let code = CodeIntelligence::compute_source_file(repository, commit, path)
+        .ok_or_else(|| anyhow::anyhow!("Failed to compute source file"))?;
+    if !is_valid_file(&code) {
+        anyhow::bail!("Invalid file");
+    }
+
+    let origin = indexer.get_doc(id).await?;
+    indexer.delete_doc(id);
+    indexer
+        .add(builder.backfill_doc_attributes(&origin, &code).await)
+        .await;
+
+    Ok(())
 }
 
 fn is_valid_file(file: &SourceCode) -> bool {

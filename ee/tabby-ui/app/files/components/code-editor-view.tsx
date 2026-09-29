@@ -1,5 +1,6 @@
 import React from 'react'
 import { foldGutter } from '@codemirror/language'
+import { openSearchPanel } from '@codemirror/search'
 import { Extension, Line } from '@codemirror/state'
 import { drawSelection, EditorView } from '@codemirror/view'
 import { isNil } from 'lodash-es'
@@ -15,11 +16,10 @@ import { highlightTagExtension } from '@/components/codemirror/tag-range-highlig
 import { codeTagHoverTooltip } from '@/components/codemirror/tooltip-extesion'
 
 import { emitter, LineMenuActionEventPayload } from '../lib/event-emitter'
-import { ActionBarWidgetExtension } from './action-bar-widget/action-bar-widget-extension'
 import {
   selectLinesGutter,
   setSelectedLines
-} from './line-menu-extension/line-menu-extension'
+} from '../lib/line-menu-extension/line-menu-extension'
 import { SourceCodeBrowserContext } from './source-code-browser'
 import {
   generateEntryPath,
@@ -28,13 +28,22 @@ import {
   viewModelToKind
 } from './utils'
 
-import './line-menu-extension/line-menu.css'
+import '../lib/line-menu-extension/line-menu.css'
 
+import { EditorFileContext } from 'tabby-chat-panel/index'
+
+import { useLatest } from '@/lib/hooks/use-latest'
 import { filename2prism } from '@/lib/language-utils'
+
+import { ActionBarWidgetExtension } from '../lib/action-bar-widget/action-bar-widget-extension'
+import { search } from '../lib/editor-search-extension/search'
+import { SearchPanel } from '../lib/editor-search-extension/search-panel'
+import { SelectionChangeExtension } from '../lib/selection-extension'
 
 interface CodeEditorViewProps {
   value: string
   language: string
+  className?: string
 }
 
 const CodeEditorView: React.FC<CodeEditorViewProps> = ({ value, language }) => {
@@ -53,13 +62,14 @@ const CodeEditorView: React.FC<CodeEditorViewProps> = ({ value, language }) => {
     activePath,
     activeEntryInfo,
     activeRepo,
-    activeRepoRef
+    activeRepoRef,
+    textEditorViewRef
   } = React.useContext(SourceCodeBrowserContext)
   const { basename } = activeEntryInfo
   const gitUrl = activeRepo?.gitUrl ?? ''
 
   const extensions = React.useMemo(() => {
-    let result: Extension[] = [
+    const result: Extension[] = [
       selectLinesGutter({
         onSelectLine: range => {
           if (!range) {
@@ -89,8 +99,53 @@ const CodeEditorView: React.FC<CodeEditorViewProps> = ({ value, language }) => {
           return dom
         }
       }),
-      drawSelection()
+      drawSelection(),
+      search({
+        createPanel: config => new SearchPanel(config)
+      })
     ]
+    if (isChatEnabled) {
+      result.push(
+        SelectionChangeExtension(
+          (
+            context:
+              | {
+                  content: string
+                }
+              | {
+                  content: string
+                  startLine: number
+                  endLine: number
+                }
+              | null
+          ) => {
+            if (!context || !activeEntryInfo?.basename || !activeRepo) {
+              return null
+            }
+
+            const editorFileContext: EditorFileContext = {
+              kind: 'file',
+              filepath: {
+                kind: 'git',
+                filepath: activeEntryInfo.basename,
+                gitUrl: activeRepo?.gitUrl
+              },
+              range:
+                'startLine' in context
+                  ? {
+                      start: context.startLine,
+                      end: context.endLine
+                    }
+                  : undefined,
+              content: context.content
+            }
+
+            emitter.emit('selection_change', editorFileContext)
+          }
+        )
+      )
+    }
+
     if (isChatEnabled && activePath && basename) {
       result.push(
         ActionBarWidgetExtension({ language, path: basename, gitUrl })
@@ -110,7 +165,7 @@ const CodeEditorView: React.FC<CodeEditorViewProps> = ({ value, language }) => {
   React.useEffect(() => {
     const onClickLineMenu = (data: LineMenuActionEventPayload) => {
       if (typeof lineNumber !== 'number') return
-      if (data.action === 'copy_permalink') {
+      if (data.action === 'copy-permalink') {
         const _link = generateEntryPath(
           activeRepo,
           activeRepoRef?.ref?.commit ?? activeRepoRef?.name,
@@ -136,7 +191,7 @@ const CodeEditorView: React.FC<CodeEditorViewProps> = ({ value, language }) => {
         copyToClipboard(link.toString())
         return
       }
-      if (data.action === 'copy_line') {
+      if (data.action === 'copy-line') {
         if (!editorView) return
         const line = editorView.state.doc.line(lineNumber)
         let endLine: Line | undefined = undefined
@@ -200,8 +255,37 @@ const CodeEditorView: React.FC<CodeEditorViewProps> = ({ value, language }) => {
     }
   }, [value, lineNumber, editorView])
 
+  const openSearch = useLatest(() => {
+    if (editorView) {
+      openSearchPanel(editorView)
+    }
+  })
+
+  React.useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!editorView) return
+
+      const isMac = navigator.userAgent.toUpperCase().indexOf('MAC') >= 0
+      const isFindInPageShortcut =
+        (isMac ? event.metaKey : event.ctrlKey) && event.key === 'f'
+      if (isFindInPageShortcut) {
+        event.preventDefault()
+        openSearch.current()
+      }
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    textEditorViewRef.current = editorView
+
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      emitter.emit('selection_change', null)
+    }
+  }, [editorView])
+
   return (
     <CodeEditor
+      className="pb-2"
       value={value}
       theme={theme}
       language={language}

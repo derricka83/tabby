@@ -1,15 +1,20 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
 use sqlx::{query, query_as, types::Json, FromRow};
 use tabby_db_macros::query_paged_as;
 
-use crate::{AsSqliteDateTimeString, DbConn};
+use crate::{
+    attachment::{
+        Attachment, AttachmentClientCode, AttachmentCode, AttachmentCodeFileList, AttachmentDoc,
+    },
+    AsSqliteDateTimeString, DbConn,
+};
 
 #[derive(FromRow)]
 pub struct ThreadDAO {
     pub id: i64,
     pub user_id: i64,
+    pub is_ephemeral: bool,
     pub relevant_questions: Option<Json<Vec<String>>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -23,35 +28,16 @@ pub struct ThreadMessageDAO {
     pub role: String,
     pub content: String,
 
-    pub code_attachments: Option<Json<Vec<ThreadMessageAttachmentCode>>>,
-    pub client_code_attachments: Option<Json<Vec<ThreadMessageAttachmentClientCode>>>,
-    pub doc_attachments: Option<Json<Vec<ThreadMessageAttachmentDoc>>>,
+    pub code_source_id: Option<String>,
+    pub attachment: Option<Json<Attachment>>,
 
+    // Deprecated since 0.25 (not removed from db yet).
+    // FIXME(meng): remove these columns from db in 0.26.
+    // pub code_attachments: Option<Json<Vec<AttachmentCode>>>,
+    // pub client_code_attachments: Option<Json<Vec<AttachmentClientCode>>>,
+    // pub doc_attachments: Option<Json<Vec<AttachmentDoc>>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ThreadMessageAttachmentDoc {
-    pub title: String,
-    pub link: String,
-    pub content: String,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ThreadMessageAttachmentCode {
-    pub git_url: String,
-    pub language: String,
-    pub filepath: String,
-    pub content: String,
-    pub start_line: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ThreadMessageAttachmentClientCode {
-    pub filepath: Option<String>,
-    pub start_line: Option<usize>,
-    pub content: String,
 }
 
 impl DbConn {
@@ -70,6 +56,7 @@ impl DbConn {
     pub async fn list_threads(
         &self,
         ids: Option<&[i64]>,
+        user_id: Option<i64>,
         is_ephemeral: Option<bool>,
         limit: Option<usize>,
         skip_id: Option<i32>,
@@ -81,6 +68,10 @@ impl DbConn {
             let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
             let ids = ids.join(", ");
             conditions.push(format!("id in ({ids})"));
+        }
+
+        if let Some(user_id) = user_id {
+            conditions.push(format!("user_id = {user_id}"));
         }
 
         if let Some(is_ephemeral) = is_ephemeral {
@@ -98,6 +89,7 @@ impl DbConn {
             [
                 "id",
                 "user_id",
+                "is_ephemeral",
                 "relevant_questions" as "relevant_questions: Json<Vec<String>>",
                 "created_at" as "created_at: DateTime<Utc>",
                 "updated_at" as "updated_at: DateTime<Utc>"
@@ -147,9 +139,9 @@ impl DbConn {
         thread_id: i64,
         role: &str,
         content: &str,
-        code_attachments: Option<&[ThreadMessageAttachmentCode]>,
-        client_code_attachments: Option<&[ThreadMessageAttachmentClientCode]>,
-        doc_attachments: Option<&[ThreadMessageAttachmentDoc]>,
+        code_attachments: Option<&[AttachmentCode]>,
+        client_code_attachments: Option<&[AttachmentClientCode]>,
+        doc_attachments: Option<&[AttachmentDoc]>,
         verify_last_message_role: bool,
     ) -> Result<i64> {
         if verify_last_message_role {
@@ -169,10 +161,8 @@ impl DbConn {
                 thread_id,
                 role,
                 content,
-                code_attachments,
-                client_code_attachments,
-                doc_attachments
-            ) VALUES (?, ?, ?, ?, ?, ?)"#,
+                attachment
+            ) VALUES (?, ?, ?, JSON_OBJECT('code', JSON(?), 'client_code', JSON(?), 'doc', JSON(?)))"#,
             thread_id,
             role,
             content,
@@ -186,15 +176,52 @@ impl DbConn {
         Ok(res.last_insert_rowid())
     }
 
+    pub async fn update_thread_message_code_file_list_attachment(
+        &self,
+        message_id: i64,
+        file_list: &[String],
+        truncated: bool,
+    ) -> Result<()> {
+        let code_file_list_attachment = Json(AttachmentCodeFileList {
+            file_list: file_list.into(),
+            truncated,
+        });
+        query!(
+            "UPDATE thread_messages SET attachment = JSON_SET(attachment, '$.code_file_list', JSON(?)), updated_at = DATETIME('now') WHERE id = ?",
+            code_file_list_attachment,
+            message_id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn update_thread_message_code_attachments(
         &self,
         message_id: i64,
-        code_attachments: &[ThreadMessageAttachmentCode],
+        code_attachments: &[AttachmentCode],
     ) -> Result<()> {
         let code_attachments = Json(code_attachments);
         query!(
-            "UPDATE thread_messages SET code_attachments = ?, updated_at = DATETIME('now') WHERE id = ?",
+            "UPDATE thread_messages SET attachment = JSON_SET(attachment, '$.code', JSON(?)), updated_at = DATETIME('now') WHERE id = ?",
             code_attachments,
+            message_id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_thread_message_code_source_id(
+        &self,
+        message_id: i64,
+        code_source_id: &str,
+    ) -> Result<()> {
+        query!(
+            "UPDATE thread_messages SET code_source_id = ?, updated_at = DATETIME('now') WHERE id = ?",
+            code_source_id,
             message_id
         )
         .execute(&self.pool)
@@ -206,12 +233,30 @@ impl DbConn {
     pub async fn update_thread_message_doc_attachments(
         &self,
         message_id: i64,
-        doc_attachments: &[ThreadMessageAttachmentDoc],
+        doc_attachments: &[AttachmentDoc],
     ) -> Result<()> {
         let doc_attachments = Json(doc_attachments);
         query!(
-            "UPDATE thread_messages SET doc_attachments = ?, updated_at = DATETIME('now') WHERE id = ?",
+            "UPDATE thread_messages SET attachment = JSON_SET(attachment, '$.doc', JSON(?)), updated_at = DATETIME('now') WHERE id = ?",
             doc_attachments,
+            message_id
+        )
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn update_thread_message_content(
+        &self,
+        thread_id: i64,
+        message_id: i64,
+        content: &str,
+    ) -> Result<()> {
+        query!(
+            "UPDATE thread_messages SET content = ?, updated_at = DATETIME('now') WHERE thread_id = ? AND id = ?",
+            content,
+            thread_id,
             message_id
         )
         .execute(&self.pool)
@@ -244,9 +289,8 @@ impl DbConn {
                 thread_id,
                 role,
                 content,
-                code_attachments as "code_attachments: Json<Vec<ThreadMessageAttachmentCode>>",
-                client_code_attachments as "client_code_attachments: Json<Vec<ThreadMessageAttachmentClientCode>>",
-                doc_attachments as "doc_attachments: Json<Vec<ThreadMessageAttachmentDoc>>",
+                code_source_id,
+                attachment as "attachment: Json<Attachment>",
                 created_at as "created_at: DateTime<Utc>",
                 updated_at as "updated_at: DateTime<Utc>"
             FROM thread_messages
@@ -268,7 +312,7 @@ impl DbConn {
         skip_id: Option<i32>,
         backwards: bool,
     ) -> Result<Vec<ThreadMessageDAO>> {
-        let condition = format!("thread_id = {}", thread_id);
+        let condition = format!("thread_id = {thread_id}");
         let messages = query_paged_as!(
             ThreadMessageDAO,
             "thread_messages",
@@ -277,9 +321,8 @@ impl DbConn {
                 "thread_id",
                 "role",
                 "content",
-                "code_attachments" as "code_attachments: Json<Vec<ThreadMessageAttachmentCode>>",
-                "client_code_attachments" as "client_code_attachments: Json<Vec<ThreadMessageAttachmentClientCode>>",
-                "doc_attachments" as "doc_attachments: Json<Vec<ThreadMessageAttachmentDoc>>",
+                "code_source_id",
+                "attachment" as "attachment: Json<Attachment>",
                 "created_at" as "created_at: DateTime<Utc>",
                 "updated_at" as "updated_at: DateTime<Utc>"
             ],
@@ -335,6 +378,14 @@ impl DbConn {
         )
         .execute(&self.pool)
         .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_thread(&self, id: i64) -> Result<()> {
+        query!("DELETE FROM threads WHERE id = ?", id,)
+            .execute(&self.pool)
+            .await?;
 
         Ok(())
     }
@@ -408,7 +459,7 @@ mod tests {
 
         // The remaining thread should be the non-ephemeral thread
         let threads = db
-            .list_threads(None, None, None, None, false)
+            .list_threads(None, None, None, None, None, false)
             .await
             .unwrap();
         assert_eq!(threads.len(), 1);
@@ -416,7 +467,7 @@ mod tests {
 
         // No threads are ephemeral
         let threads = db
-            .list_threads(None, Some(true), None, None, false)
+            .list_threads(None, None, Some(true), None, None, false)
             .await
             .unwrap();
         assert_eq!(threads.len(), 0);

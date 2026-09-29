@@ -15,7 +15,7 @@ import org.eclipse.swt.widgets.MenuItem;
 import org.eclipse.ui.menus.WorkbenchWindowControlContribution;
 
 import com.tabbyml.tabby4eclipse.Images;
-import com.tabbyml.tabby4eclipse.chat.ChatView;
+import com.tabbyml.tabby4eclipse.chat.ChatViewUtils;
 import com.tabbyml.tabby4eclipse.lsp.LanguageServerService;
 import com.tabbyml.tabby4eclipse.lsp.StatusInfoHolder;
 import com.tabbyml.tabby4eclipse.lsp.protocol.StatusInfo;
@@ -148,7 +148,6 @@ public class StatusbarContribution extends WorkbenchWindowControlContribution {
 		default:
 			break;
 		}
-		
 
 		MenuItem openChatViewItem = new MenuItem(menu, SWT.NONE);
 		openChatViewItem.setImage(Images.getIcon(Images.ICON_CHAT));
@@ -156,10 +155,10 @@ public class StatusbarContribution extends WorkbenchWindowControlContribution {
 		openChatViewItem.addSelectionListener(new SelectionAdapter() {
 			@Override
 			public void widgetSelected(SelectionEvent e) {
-				ChatView.openChatView();
+				ChatViewUtils.openChatView();
 			}
 		});
-		
+
 		MenuItem openPreferencesItem = new MenuItem(menu, SWT.NONE);
 		openPreferencesItem.setImage(Images.getIcon(Images.ICON_SETTINGS));
 		openPreferencesItem.setText("Open Settings");
@@ -169,7 +168,7 @@ public class StatusbarContribution extends WorkbenchWindowControlContribution {
 				MainPreferencesPage.openPreferences();
 			}
 		});
-		
+
 		return menu;
 	}
 }

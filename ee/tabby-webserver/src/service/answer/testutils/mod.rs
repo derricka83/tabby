@@ -1,4 +1,6 @@
-use async_openai::{
+use std::sync::Arc;
+
+use async_openai_alt::{
     error::OpenAIError,
     types::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
@@ -6,25 +8,53 @@ use async_openai::{
         CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, Role,
     },
 };
-use axum::async_trait;
-use tabby_common::api::{
-    code::{CodeSearch, CodeSearchError, CodeSearchParams, CodeSearchQuery, CodeSearchResponse},
-    doc::{DocSearch, DocSearchDocument, DocSearchError, DocSearchHit, DocSearchResponse},
+use async_trait::async_trait;
+use juniper::ID;
+use tabby_common::{
+    api::{
+        code::{
+            CodeSearch, CodeSearchDocument, CodeSearchError, CodeSearchHit, CodeSearchParams,
+            CodeSearchQuery, CodeSearchResponse, CodeSearchScores,
+        },
+        structured_doc::{
+            DocSearch, DocSearchDocument, DocSearchError, DocSearchHit, DocSearchResponse,
+            DocSearchWebDocument,
+        },
+    },
+    config::AnswerConfig,
 };
+use tabby_db::DbConn;
 use tabby_inference::ChatCompletionStream;
 use tabby_schema::{
     context::{ContextInfo, ContextService},
+    integration::IntegrationService,
+    job::JobService,
     policy::AccessPolicy,
+    repository::RepositoryService,
     Result,
 };
 
-pub struct FakeChatCompletionStream;
+use crate::{integration, job, repository};
+
+pub struct FakeChatCompletionStream {
+    pub return_error: bool,
+}
+
 #[async_trait]
 impl ChatCompletionStream for FakeChatCompletionStream {
     async fn chat(
         &self,
         _request: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
+        if self.return_error {
+            return Err(OpenAIError::ApiError(async_openai_alt::error::ApiError {
+                message: "error".to_string(),
+                code: None,
+                param: None,
+                r#type: None,
+            }));
+        }
+
         Ok(CreateChatCompletionResponse {
             id: "test-response".to_owned(),
             created: 0,
@@ -42,15 +72,19 @@ impl ChatCompletionStream for FakeChatCompletionStream {
                     ),
                     tool_calls: None,
                     function_call: None,
+                    refusal: None,
                 },
                 finish_reason: Some(FinishReason::Stop),
                 logprobs: None,
             }],
             system_fingerprint: Some("seed".to_owned()),
+            service_tier: None,
             usage: Some(CompletionUsage {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
             }),
         })
     }
@@ -72,11 +106,20 @@ impl ChatCompletionStream for FakeChatCompletionStream {
                         content: Some("This is the first part of the response. ".to_string()),
                         function_call: None,
                         tool_calls: None,
+                        refusal: None,
                     },
                     finish_reason: None,
                     logprobs: None,
                 }],
                 system_fingerprint: Some("seed".to_owned()),
+                service_tier: None,
+                usage: Some(CompletionUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    total_tokens: 3,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                }),
             }),
             Ok(CreateChatCompletionStreamResponse {
                 id: "test-stream-response".to_owned(),
@@ -90,11 +133,20 @@ impl ChatCompletionStream for FakeChatCompletionStream {
                         content: Some("This is the second part of the response.".to_string()),
                         function_call: None,
                         tool_calls: None,
+                        refusal: None,
                     },
                     finish_reason: Some(FinishReason::Stop),
                     logprobs: None,
                 }],
                 system_fingerprint: Some("seed".to_owned()),
+                service_tier: None,
+                usage: Some(CompletionUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 2,
+                    total_tokens: 3,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                }),
             }),
         ]);
 
@@ -110,7 +162,44 @@ impl CodeSearch for FakeCodeSearch {
         _query: CodeSearchQuery,
         _params: CodeSearchParams,
     ) -> Result<CodeSearchResponse, CodeSearchError> {
-        Ok(CodeSearchResponse { hits: vec![] })
+        Ok(CodeSearchResponse {
+            hits: vec![
+                CodeSearchHit {
+                    doc: CodeSearchDocument {
+                        filepath: "src/lib.rs".to_string(),
+                        body: "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}".to_string(),
+                        start_line: Some(1),
+                        language: "rust".to_string(),
+                        file_id: "1".to_string(),
+                        chunk_id: "chunk1".to_string(),
+                        git_url: "https://github.com/test/repo".to_string(),
+                        commit: Some("commit".to_string()),
+                    },
+                    scores: CodeSearchScores {
+                        bm25: 0.8,
+                        embedding: 0.9,
+                        rrf: 0.85,
+                    },
+                },
+                CodeSearchHit {
+                    doc: CodeSearchDocument {
+                        filepath: "src/main.rs".to_string(),
+                        body: "fn main() {\n    println!(\"Hello World\");\n}".to_string(),
+                        start_line: Some(1),
+                        language: "rust".to_string(),
+                        file_id: "2".to_string(),
+                        chunk_id: "chunk2".to_string(),
+                        git_url: "https://github.com/test/repo".to_string(),
+                        commit: Some("commit".to_string()),
+                    },
+                    scores: CodeSearchScores {
+                        bm25: 0.7,
+                        embedding: 0.8,
+                        rrf: 0.75,
+                    },
+                },
+            ],
+        })
     }
 }
 
@@ -150,43 +239,43 @@ impl DocSearch for FakeDocSearch {
         let hits = vec![
             DocSearchHit {
                 score: 1.0,
-                doc: DocSearchDocument {
+                doc: DocSearchDocument::Web(DocSearchWebDocument {
                     title: "Document 1".to_string(),
                     link: "https://example.com/doc1".to_string(),
                     snippet: "Snippet for Document 1".to_string(),
-                },
+                }),
             },
             DocSearchHit {
                 score: 0.9,
-                doc: DocSearchDocument {
+                doc: DocSearchDocument::Web(DocSearchWebDocument {
                     title: "Document 2".to_string(),
                     link: "https://example.com/doc2".to_string(),
                     snippet: "Snippet for Document 2".to_string(),
-                },
+                }),
             },
             DocSearchHit {
                 score: 0.8,
-                doc: DocSearchDocument {
+                doc: DocSearchDocument::Web(DocSearchWebDocument {
                     title: "Document 3".to_string(),
                     link: "https://example.com/doc3".to_string(),
                     snippet: "Snippet for Document 3".to_string(),
-                },
+                }),
             },
             DocSearchHit {
                 score: 0.7,
-                doc: DocSearchDocument {
+                doc: DocSearchDocument::Web(DocSearchWebDocument {
                     title: "Document 4".to_string(),
                     link: "https://example.com/doc4".to_string(),
                     snippet: "Snippet for Document 4".to_string(),
-                },
+                }),
             },
             DocSearchHit {
                 score: 0.6,
-                doc: DocSearchDocument {
+                doc: DocSearchDocument::Web(DocSearchWebDocument {
                     title: "Document 5".to_string(),
                     link: "https://example.com/doc5".to_string(),
                     snippet: "Snippet for Document 5".to_string(),
-                },
+                }),
             },
         ];
         Ok(DocSearchResponse { hits })
@@ -199,4 +288,40 @@ impl ContextService for FakeContextService {
     async fn read(&self, _policy: Option<&AccessPolicy>) -> Result<ContextInfo> {
         Ok(ContextInfo { sources: vec![] })
     }
+}
+
+pub fn make_answer_config() -> AnswerConfig {
+    AnswerConfig {
+        code_search_params: make_code_search_params(),
+        presence_penalty: 0.1,
+        system_prompt: AnswerConfig::default_system_prompt(),
+    }
+}
+
+pub fn make_code_search_params() -> CodeSearchParams {
+    CodeSearchParams {
+        min_bm25_score: 0.5,
+        min_embedding_score: 0.7,
+        min_rrf_score: 0.3,
+        num_to_return: 5,
+        num_to_score: 10,
+    }
+}
+
+pub async fn make_repository_service(db: DbConn) -> Result<Arc<dyn RepositoryService>> {
+    let job_service: Arc<dyn JobService> = Arc::new(job::create(db.clone()).await);
+    let integration_service: Arc<dyn IntegrationService> =
+        Arc::new(integration::create(db.clone(), job_service.clone()));
+    Ok(repository::create(
+        db.clone(),
+        integration_service.clone(),
+        job_service.clone(),
+    ))
+}
+pub async fn make_policy() -> AccessPolicy {
+    AccessPolicy::new(
+        DbConn::new_in_memory().await.unwrap(),
+        &ID::from("nihao".to_string()),
+        false,
+    )
 }

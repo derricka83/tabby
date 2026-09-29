@@ -1,8 +1,35 @@
+import { isNil } from 'lodash-es'
+import { useQuery } from 'urql'
+
+import { graphql } from '@/lib/gql/generates'
+import { ModelHealthBackend } from '@/lib/gql/generates/graphql'
+import { ModelSource } from '@/lib/hooks/use-workers'
 import { cn } from '@/lib/utils'
+import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger
+} from '@/components/ui/hover-card'
+import {
+  IconCircleHelp,
+  IconRotate,
+  IconSpinner,
+  IconSquareActivity
+} from '@/components/ui/icons'
+
+const testModelConnectionQuery = graphql(/* GraphQL */ `
+  query TestModelConnection($backend: ModelHealthBackend!) {
+    testModelConnection(backend: $backend) {
+      latencyMs
+    }
+  }
+`)
 
 interface RunnerCardProps {
-  kind: string
+  kind: ModelHealthBackend
   device: string
   addr: string
   arch: string
@@ -10,6 +37,7 @@ interface RunnerCardProps {
   name: string
   cpuCount: number
   cudaDevices: string[]
+  source: ModelSource
 }
 
 export default function RunnerCard({
@@ -19,7 +47,8 @@ export default function RunnerCard({
   device,
   cudaDevices,
   cpuCount,
-  cpuInfo
+  cpuInfo,
+  source
 }: RunnerCardProps) {
   const textClass = cn(
     'ml-2',
@@ -27,9 +56,10 @@ export default function RunnerCard({
     'overflow-hidden',
     'text-ellipsis'
   )
-  const cpuMessage = `${cpuInfo} (${cpuCount} cores)`
+  const cpuMessage =
+    source === ModelSource.local ? `${cpuInfo} (${cpuCount} cores)` : undefined
   return (
-    <Card className="rounded-xl p-2 shadow-md lg:w-[260px]">
+    <Card className="relative rounded-xl p-2 shadow-md lg:w-[260px]">
       <CardHeader className="p-0 px-4 pb-2 pt-4">
         <CardTitle className="text-md flex items-center font-normal">
           <ModelIcon type={kind} />
@@ -62,34 +92,36 @@ export default function RunnerCard({
             {addr}
           </p>
         </Info>
-        <Info>
-          <svg
-            className=" h-5 w-5"
-            fill="none"
-            height="24"
-            stroke="currentColor"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth="2"
-            viewBox="0 0 24 24"
-            width="24"
-            xmlns="http://www.w3.org/2000/svg"
-          >
-            <rect height="16" rx="2" width="16" x="4" y="4" />
-            <rect height="6" width="6" x="9" y="9" />
-            <path d="M15 2v2" />
-            <path d="M15 20v2" />
-            <path d="M2 15h2" />
-            <path d="M2 9h2" />
-            <path d="M20 15h2" />
-            <path d="M20 9h2" />
-            <path d="M9 2v2" />
-            <path d="M9 20v2" />
-          </svg>
-          <p title={cpuMessage} className={textClass}>
-            {cpuMessage}
-          </p>
-        </Info>
+        {!!cpuMessage && (
+          <Info>
+            <svg
+              className=" h-5 w-5"
+              fill="none"
+              height="24"
+              stroke="currentColor"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth="2"
+              viewBox="0 0 24 24"
+              width="24"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <rect height="16" rx="2" width="16" x="4" y="4" />
+              <rect height="6" width="6" x="9" y="9" />
+              <path d="M15 2v2" />
+              <path d="M15 20v2" />
+              <path d="M2 15h2" />
+              <path d="M2 9h2" />
+              <path d="M20 15h2" />
+              <path d="M20 9h2" />
+              <path d="M9 2v2" />
+              <path d="M9 20v2" />
+            </svg>
+            <p title={cpuMessage} className={textClass}>
+              {cpuMessage}
+            </p>
+          </Info>
+        )}
         {device == 'cuda' &&
           cudaDevices?.length &&
           cudaDevices.map((x, i) => (
@@ -121,7 +153,19 @@ export default function RunnerCard({
               </p>
             </Info>
           ))}
+        <Info>
+          <IconSquareActivity className="h-5 w-5" />
+          <HealthInfoView backend={kind} className={textClass} />
+        </Info>
       </CardContent>
+      <div className="absolute right-1 top-0">
+        <Badge
+          variant="secondary"
+          className="px-2 text-xs font-normal leading-tight"
+        >
+          {source === ModelSource.remote ? 'Remote' : 'Local'}
+        </Badge>
+      </div>
     </Card>
   )
 }
@@ -178,7 +222,7 @@ function ModelIcon({ type }: { type: string }) {
         <path d="M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1" />
       </svg>
     )
-  } else if (type == 'INDEX') {
+  } else if (type == 'EMBEDDING') {
     return (
       <svg
         xmlns="http://www.w3.org/2000/svg"
@@ -199,4 +243,62 @@ function ModelIcon({ type }: { type: string }) {
       </svg>
     )
   }
+}
+
+function HealthInfoView({
+  backend,
+  className
+}: {
+  backend: ModelHealthBackend
+  errorMessage?: string
+  className?: string
+}) {
+  const [{ data, fetching, stale, error }, reexecuteQuery] = useQuery({
+    query: testModelConnectionQuery,
+    variables: {
+      backend
+    }
+  })
+
+  const connected = !isNil(data?.testModelConnection?.latencyMs)
+
+  if (fetching || stale) {
+    return (
+      <div className={cn(className)}>
+        <IconSpinner />
+      </div>
+    )
+  }
+
+  return (
+    <div className={cn('flex items-center gap-3', className)}>
+      {connected ? (
+        <p className="flex items-center gap-0.5">Connected</p>
+      ) : (
+        <HoverCard openDelay={0}>
+          <HoverCardTrigger asChild>
+            <div className="flex cursor-pointer items-center gap-0.5 text-destructive hover:text-destructive/80 hover:underline">
+              <IconCircleHelp />
+              Unreachable
+            </div>
+          </HoverCardTrigger>
+          <HoverCardContent className="w-96 bg-secondary" align="start">
+            <div className="whitespace-pre-wrap break-all">
+              {error?.message || 'Failed to connect model'}
+            </div>
+          </HoverCardContent>
+        </HoverCard>
+      )}
+
+      <Button
+        className="h-5 w-5 rounded-sm"
+        size="icon"
+        variant="ghost"
+        disabled={fetching}
+        onClick={reexecuteQuery}
+      >
+        <IconRotate className="h-3.5 w-3.5" />
+      </Button>
+    </div>
+  )
 }

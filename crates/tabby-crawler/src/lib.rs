@@ -1,7 +1,9 @@
+mod llms_txt_parser;
 mod types;
 
 use std::process::Stdio;
 
+use anyhow::anyhow;
 use async_stream::stream;
 use futures::{Stream, StreamExt};
 use readable_readability::Readability;
@@ -44,7 +46,9 @@ async fn crawl_url(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command.spawn()?;
+    let mut child = command
+        .spawn()
+        .map_err(|e| anyhow!("Failed to run katana: {}", e))?;
 
     let stdout = child.stdout.take().expect("Failed to acquire stdout");
     let mut stdout = tokio::io::BufReader::new(stdout).lines();
@@ -89,7 +93,7 @@ async fn crawl_url(
             if !data
                 .response
                 .headers
-                .get("content_type")
+                .get("content-type")
                 .is_some_and(|ct| ct.starts_with("text/html"))
             {
                 continue;
@@ -148,6 +152,41 @@ pub async fn crawl_pipeline(
         .filter_map(move |data| async move { to_document(data) }))
 }
 
+/// Attempts to fetch `llms-full.txt` from the given base URL,
+/// then splits its markdown content into multiple sections based on H1 headings.
+/// Each section becomes a separate `CrawledDocument`.
+/// Returns a vector of `CrawledDocument`s if successful.
+pub async fn crawler_llms(start_url: &str) -> anyhow::Result<Vec<CrawledDocument>> {
+    // Remove trailing slash from the base URL if present.
+    let base_url = start_url.trim_end_matches('/');
+
+    // Check if the URL already ends with llms-full.txt or llms.txt
+    let llms_full_url = if base_url.ends_with("llms-full.txt") {
+        base_url.to_string()
+    } else if base_url.ends_with("llms.txt") {
+        // If URL ends with llms.txt, try to access llms-full.txt instead
+        let base_without_llms = base_url.trim_end_matches("llms.txt");
+        format!("{base_without_llms}llms-full.txt")
+    } else {
+        format!("{base_url}/llms-full.txt")
+    };
+
+    let resp = reqwest::get(&llms_full_url).await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Unable to fetch llms-full.txt from {}", llms_full_url);
+    }
+    let body = resp.text().await?;
+    debug!("Successfully fetched llms-full.txt: {}", llms_full_url);
+
+    // Split the fetched markdown content into sections.
+    let docs = llms_txt_parser::split_llms_content(&body, start_url);
+    if docs.is_empty() {
+        anyhow::bail!("No sections found in llms-full.txt from {}", llms_full_url);
+    }
+
+    Ok(docs)
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -181,5 +220,33 @@ mod tests {
         let doc = to_document(data).unwrap();
         assert_eq!(doc.url, "https://example.com");
         assert_eq!(doc.markdown, "Hello, World!");
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_crawler_llms_success_developers_cloudflare_with_url() {
+        let base_url = "https://developers.cloudflare.com/workers-ai";
+        let result = crawler_llms(base_url).await;
+        assert!(result.is_ok(), "Expected success from {base_url}");
+        let docs = result.unwrap();
+        assert!(
+            !docs.is_empty(),
+            "Expected at least one section from llms-full.txt at {base_url}"
+        );
+        println!("Fetched {} documents from {}", docs.len(), base_url);
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn test_crawler_llms_success_docs_perplexity_with_source() {
+        let base_url = "https://docs.perplexity.ai";
+        let result = crawler_llms(base_url).await;
+        assert!(result.is_ok(), "Expected success from {base_url}");
+        let docs = result.unwrap();
+        assert!(
+            !docs.is_empty(),
+            "Expected at least one section from llms-full.txt at {base_url}"
+        );
+        println!("Fetched {} documents from {}", docs.len(), base_url);
     }
 }

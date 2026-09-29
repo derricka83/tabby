@@ -4,11 +4,15 @@ pub mod auth;
 pub mod constants;
 pub mod context;
 pub mod email;
+pub mod ingestion;
 pub mod integration;
 pub mod interface;
 pub mod job;
 pub mod license;
+pub mod notification;
+pub mod page;
 pub mod repository;
+pub mod retrieval;
 pub mod setting;
 pub mod thread;
 pub mod user_event;
@@ -16,26 +20,50 @@ pub mod user_group;
 pub mod web_documents;
 pub mod worker;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use access_policy::{AccessPolicyService, SourceIdAccessPolicy};
+use async_openai_alt::{
+    error::OpenAIError,
+    types::{
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestMessage,
+        ChatCompletionRequestSystemMessageContent, ChatCompletionRequestUserMessageArgs,
+        ChatCompletionRequestUserMessageContent, CreateChatCompletionRequestArgs,
+    },
+};
 use auth::{
-    AuthenticationService, Invitation, RefreshTokenResponse, RegisterResponse, TokenAuthResponse,
+    AuthProvider, AuthProviderKind, AuthenticationService, Invitation, LdapCredential,
+    RefreshTokenResponse, RegisterResponse, TokenAuthResponse, UpdateLdapCredentialInput,
     UserSecured,
 };
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use context::{ContextInfo, ContextService};
+use futures::StreamExt;
 use interface::UserValue;
 use job::{JobRun, JobService};
 use juniper::{
-    graphql_object, graphql_subscription, graphql_value, FieldError, GraphQLObject, IntoFieldError,
-    Object, RootNode, ScalarValue, Value, ID,
+    graphql_object, graphql_subscription, graphql_value, FieldError, GraphQLEnum, GraphQLObject,
+    IntoFieldError, Object, RootNode, ScalarValue, Value, ID,
+};
+use ldap3::result::LdapError;
+use notification::NotificationService;
+use page::{
+    CreatePageRunInput, CreatePageSectionRunInput, CreateThreadToPageRunInput, PageRunStream,
+    SectionRunStream, ThreadToPageRunStream, UpdatePageContentInput, UpdatePageSectionContentInput,
+    UpdatePageSectionTitleInput, UpdatePageTitleInput,
 };
 use repository::RepositoryGrepOutput;
-use tabby_common::api::{code::CodeSearch, event::EventLogger};
+use strum::IntoEnumIterator;
+use tabby_common::{
+    api::{code::CodeSearch, event::EventLogger},
+    config::CompletionConfig,
+};
+use tabby_inference::{
+    ChatCompletionStream, CompletionOptionsBuilder, CompletionStream, Embedding as EmbeddingService,
+};
 use thread::{CreateThreadAndRunInput, CreateThreadRunInput, ThreadRunStream, ThreadService};
-use tracing::{error, warn};
+use tracing::warn;
 use user_group::{
     CreateUserGroupInput, UpsertUserGroupMembershipInput, UserGroup, UserGroupService,
 };
@@ -43,27 +71,30 @@ use validator::{Validate, ValidationErrors};
 use worker::WorkerService;
 
 use self::{
-    analytic::{AnalyticService, CompletionStats, DiskUsageStats},
+    analytic::{AnalyticService, ChatCompletionStats, CompletionStats, DiskUsageStats},
     auth::{
         JWTPayload, OAuthCredential, OAuthProvider, PasswordChangeInput, PasswordResetInput,
         RequestInvitationInput, RequestPasswordResetEmailInput, UpdateOAuthCredentialInput,
     },
     email::{EmailService, EmailSetting, EmailSettingInput},
+    ingestion::{IngestionService, IngestionStats},
     integration::{Integration, IntegrationKind, IntegrationService},
     job::JobStats,
     license::{IsLicenseValid, LicenseInfo, LicenseService, LicenseType},
+    page::PageService,
     repository::{
         CreateIntegrationInput, FileEntrySearchResult, ProvidedRepository, Repository,
         RepositoryKind, RepositoryService, UpdateIntegrationInput,
     },
     setting::{
-        NetworkSetting, NetworkSettingInput, SecuritySetting, SecuritySettingInput, SettingService,
+        BrandingSetting, NetworkSetting, NetworkSettingInput, SecuritySetting,
+        SecuritySettingInput, SettingService,
     },
     user_event::{UserEvent, UserEventService},
     web_documents::{CreateCustomDocumentInput, CustomWebDocument, WebDocumentService},
 };
 use crate::{
-    env,
+    env, is_demo_mode,
     juniper::relay::{self, query_async, Connection},
     web_documents::{PresetWebDocument, SetPresetDocumentActiveInput},
 };
@@ -71,8 +102,12 @@ use crate::{
 pub trait ServiceLocator: Send + Sync {
     fn auth(&self) -> Arc<dyn AuthenticationService>;
     fn worker(&self) -> Arc<dyn WorkerService>;
-    fn code(&self) -> Arc<dyn CodeSearch>;
+    fn code(&self) -> Option<Arc<dyn CodeSearch>>;
+    fn chat(&self) -> Option<Arc<dyn ChatCompletionStream>>;
+    fn completion(&self) -> Option<Arc<dyn CompletionStream>>;
+    fn embedding(&self) -> Option<Arc<dyn EmbeddingService>>;
     fn logger(&self) -> Arc<dyn EventLogger>;
+    fn ingestion(&self) -> Arc<dyn IngestionService>;
     fn job(&self) -> Arc<dyn JobService>;
     fn repository(&self) -> Arc<dyn RepositoryService>;
     fn integration(&self) -> Arc<dyn IntegrationService>;
@@ -83,9 +118,11 @@ pub trait ServiceLocator: Send + Sync {
     fn user_event(&self) -> Arc<dyn UserEventService>;
     fn web_documents(&self) -> Arc<dyn WebDocumentService>;
     fn thread(&self) -> Arc<dyn ThreadService>;
+    fn page(&self) -> Option<Arc<dyn PageService>>;
     fn context(&self) -> Arc<dyn ContextService>;
     fn user_group(&self) -> Arc<dyn UserGroupService>;
     fn access_policy(&self) -> Arc<dyn AccessPolicyService>;
+    fn notification(&self) -> Arc<dyn NotificationService>;
 }
 
 pub struct Context {
@@ -125,6 +162,12 @@ pub enum CoreError {
     Other(#[from] anyhow::Error),
 }
 
+impl From<LdapError> for CoreError {
+    fn from(err: LdapError) -> Self {
+        Self::Other(err.into())
+    }
+}
+
 impl<S: ScalarValue> IntoFieldError<S> for CoreError {
     fn into_field_error(self) -> FieldError<S> {
         match self {
@@ -134,6 +177,36 @@ impl<S: ScalarValue> IntoFieldError<S> for CoreError {
             }
             Self::NotFound(msg) => FieldError::new(msg, graphql_value!({"code": "NOT_FOUND"})),
             Self::InvalidInput(errors) => from_validation_errors(errors),
+            _ => self.into(),
+        }
+    }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum TestModelConnectionError {
+    #[error("{0}")]
+    FailedToConnect(String),
+
+    #[error("Model backend is not enabled")]
+    NotEnabled,
+
+    #[error("{0}")]
+    Other(#[from] CoreError),
+}
+
+impl From<OpenAIError> for TestModelConnectionError {
+    fn from(err: OpenAIError) -> Self {
+        match err {
+            OpenAIError::ApiError(e) => Self::FailedToConnect(e.message),
+            _ => Self::FailedToConnect(err.to_string()),
+        }
+    }
+}
+
+impl<S: ScalarValue> IntoFieldError<S> for TestModelConnectionError {
+    fn into_field_error(self) -> FieldError<S> {
+        match self {
+            TestModelConnectionError::Other(err) => err.into_field_error(),
             _ => self.into(),
         }
     }
@@ -188,6 +261,61 @@ async fn check_license(ctx: &Context, license_type: &[LicenseType]) -> Result<()
     license.ensure_valid_license()
 }
 
+#[derive(GraphQLEnum)]
+enum ModelHealthBackend {
+    Chat,
+    Completion,
+    Embedding,
+}
+
+#[derive(GraphQLObject, Debug, Clone)]
+struct ModelBackendHealthInfo {
+    /// Latency in milliseconds.
+    latency_ms: i32,
+}
+
+#[derive(GraphQLObject, Clone, Debug)]
+pub struct ChatCompletionMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl From<ChatCompletionRequestMessage> for ChatCompletionMessage {
+    fn from(x: ChatCompletionRequestMessage) -> Self {
+        match x {
+            ChatCompletionRequestMessage::User(x) => ChatCompletionMessage {
+                role: "user".into(),
+                content: match x.content {
+                    ChatCompletionRequestUserMessageContent::Text(x) => x,
+                    _ => "".into(),
+                },
+            },
+            ChatCompletionRequestMessage::Assistant(x) => ChatCompletionMessage {
+                role: "assistant".into(),
+                content: match x.content {
+                    Some(ChatCompletionRequestAssistantMessageContent::Text(x)) => x,
+                    _ => "".into(),
+                },
+            },
+            ChatCompletionRequestMessage::Tool(_x) => ChatCompletionMessage {
+                role: "tool".into(),
+                content: "".into(),
+            },
+            ChatCompletionRequestMessage::System(x) => ChatCompletionMessage {
+                role: "system".into(),
+                content: match x.content {
+                    ChatCompletionRequestSystemMessageContent::Text(x) => x,
+                    _ => "".into(),
+                },
+            },
+            ChatCompletionRequestMessage::Function(_x) => ChatCompletionMessage {
+                role: "function".into(),
+                content: "".into(),
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Query;
 
@@ -205,6 +333,7 @@ impl Query {
     /// List users, accessible for all login users.
     async fn users(
         ctx: &Context,
+        ids: Option<Vec<ID>>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
@@ -219,7 +348,7 @@ impl Query {
             |after, before, first, last| async move {
                 ctx.locator
                     .auth()
-                    .list_users(after, before, first, last)
+                    .list_users(ids, after, before, first, last)
                     .await
                     .map(|users| users.into_iter().map(UserValue::UserSecured).collect())
             },
@@ -294,6 +423,12 @@ impl Query {
         ctx.locator.setting().read_security_setting().await
     }
 
+    async fn branding_setting(ctx: &Context) -> Result<BrandingSetting> {
+        let license = ctx.locator.license().read().await?;
+        license.ensure_available_features(license::LicenseFeature::CustomLogo)?;
+        ctx.locator.setting().read_branding_setting().await
+    }
+
     async fn git_repositories(
         &self,
         ctx: &Context,
@@ -366,6 +501,29 @@ impl Query {
         Ok(RepositoryGrepOutput { files, elapsed_ms })
     }
 
+    async fn auth_providers(ctx: &Context) -> Result<Vec<AuthProvider>> {
+        let mut providers = vec![];
+
+        let auth = ctx.locator.auth();
+        for x in OAuthProvider::iter() {
+            if auth
+                .read_oauth_credential(x.clone())
+                .await
+                .is_ok_and(|x| x.is_some())
+            {
+                providers.push(x.into());
+            }
+        }
+
+        if auth.read_ldap_credential().await.is_ok_and(|x| x.is_some()) {
+            providers.push(AuthProvider {
+                kind: AuthProviderKind::Ldap,
+            });
+        }
+
+        Ok(providers)
+    }
+
     async fn oauth_credential(
         ctx: &Context,
         provider: OAuthProvider,
@@ -379,12 +537,23 @@ impl Query {
         ctx.locator.auth().oauth_callback_url(provider).await
     }
 
+    async fn ldap_credential(ctx: &Context) -> Result<Option<LdapCredential>> {
+        check_admin(ctx).await?;
+        ctx.locator.auth().read_ldap_credential().await
+    }
+
     async fn server_info(ctx: &Context) -> Result<ServerInfo> {
         Ok(ServerInfo {
             is_admin_initialized: ctx.locator.auth().is_admin_initialized().await?,
             is_chat_enabled: ctx.locator.worker().is_chat_enabled().await?,
             is_email_configured: ctx.locator.email().read_setting().await?.is_some(),
             allow_self_signup: ctx.locator.auth().allow_self_signup().await?,
+            disable_password_login: ctx
+                .locator
+                .setting()
+                .read_security_setting()
+                .await?
+                .disable_password_login,
             is_demo_mode: env::is_demo_mode(),
         })
     }
@@ -429,6 +598,34 @@ impl Query {
             .await
     }
 
+    async fn chat_daily_stats_in_past_year(
+        ctx: &Context,
+        users: Option<Vec<ID>>,
+    ) -> Result<Vec<ChatCompletionStats>> {
+        let users = users.unwrap_or_default();
+        let user = check_user(ctx).await?;
+        user.policy.check_read_analytic(&users)?;
+        ctx.locator
+            .analytic()
+            .chat_daily_stats_in_past_year(users)
+            .await
+    }
+
+    async fn chat_daily_stats(
+        ctx: &Context,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        users: Option<Vec<ID>>,
+    ) -> Result<Vec<ChatCompletionStats>> {
+        let users = users.unwrap_or_default();
+        let user = check_user(ctx).await?;
+        user.policy.check_read_analytic(&users)?;
+        ctx.locator
+            .analytic()
+            .chat_daily_stats(start, end, users)
+            .await
+    }
+
     async fn user_events(
         ctx: &Context,
 
@@ -467,13 +664,18 @@ impl Query {
         .await
     }
 
+    async fn notifications(ctx: &Context) -> Result<Vec<notification::Notification>> {
+        let user = check_user(ctx).await?;
+        ctx.locator.notification().list(&user.id).await
+    }
+
     async fn disk_usage_stats(ctx: &Context) -> Result<DiskUsageStats> {
         check_admin(ctx).await?;
         ctx.locator.analytic().disk_usage_stats().await
     }
 
     async fn repository_list(ctx: &Context) -> Result<Vec<Repository>> {
-        let user = check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
 
         ctx.locator
             .repository()
@@ -482,7 +684,7 @@ impl Query {
     }
 
     async fn context_info(ctx: &Context) -> Result<ContextInfo> {
-        let user = check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
         ctx.locator.context().read(Some(&user.policy)).await
     }
 
@@ -538,6 +740,14 @@ impl Query {
         .await
     }
 
+    async fn ingestion_status(
+        ctx: &Context,
+        sources: Option<Vec<String>>,
+    ) -> Result<Vec<IngestionStats>> {
+        check_admin(ctx).await?;
+        ctx.locator.ingestion().stats(sources).await
+    }
+
     async fn threads(
         ctx: &Context,
         ids: Option<Vec<ID>>,
@@ -547,8 +757,9 @@ impl Query {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<thread::Thread>> {
-        check_user(ctx).await?;
-        relay::query_async(
+        let user = check_user_allow_auth_token(ctx).await?;
+
+        let threads = relay::query_async(
             after,
             before,
             first,
@@ -557,6 +768,37 @@ impl Query {
                 ctx.locator
                     .thread()
                     .list(ids.as_deref(), is_ephemeral, after, before, first, last)
+                    .await
+            },
+        )
+        .await?;
+
+        for thread in threads.edges.iter() {
+            let thread = &thread.node;
+            user.policy
+                .check_read_thread(&thread.user_id, thread.is_ephemeral)?;
+        }
+
+        Ok(threads)
+    }
+
+    async fn my_threads(
+        ctx: &Context,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<thread::Thread>> {
+        let user = check_user_allow_auth_token(ctx).await?;
+        relay::query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                ctx.locator
+                    .thread()
+                    .list_owned(&user.id, after, before, first, last)
                     .await
             },
         )
@@ -574,7 +816,16 @@ impl Query {
         first: Option<i32>,
         last: Option<i32>,
     ) -> Result<Connection<thread::Message>> {
-        check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
+
+        let thread = ctx
+            .locator
+            .thread()
+            .get(&thread_id)
+            .await?
+            .ok_or_else(|| CoreError::NotFound("thread not found"))?;
+        user.policy
+            .check_read_thread(&thread.user_id, thread.is_ephemeral)?;
 
         relay::query_async(
             after,
@@ -585,6 +836,67 @@ impl Query {
                 ctx.locator
                     .thread()
                     .list_thread_messages(&thread_id, after, before, first, last)
+                    .await
+            },
+        )
+        .await
+    }
+
+    /// Read pages by page IDs.
+    async fn pages(
+        ctx: &Context,
+        ids: Option<Vec<ID>>,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<page::Page>> {
+        check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        relay::query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                page_service
+                    .list(ids.as_deref(), after, before, first, last)
+                    .await
+            },
+        )
+        .await
+    }
+
+    async fn page_sections(
+        ctx: &Context,
+        page_id: ID,
+        after: Option<String>,
+        before: Option<String>,
+        first: Option<i32>,
+        last: Option<i32>,
+    ) -> Result<Connection<page::PageSection>> {
+        check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        relay::query_async(
+            after,
+            before,
+            first,
+            last,
+            |after, before, first, last| async move {
+                page_service
+                    .list_sections(&page_id, after, before, first, last)
                     .await
             },
         )
@@ -658,6 +970,99 @@ impl Query {
 
         Ok(SourceIdAccessPolicy { source_id, read })
     }
+
+    async fn test_model_connection(
+        ctx: &Context,
+        backend: ModelHealthBackend,
+    ) -> Result<ModelBackendHealthInfo, TestModelConnectionError> {
+        check_admin(ctx).await?;
+
+        // count request time in milliseconds
+        let start = Instant::now();
+
+        match backend {
+            ModelHealthBackend::Completion => {
+                if let Some(completion) = ctx.locator.completion() {
+                    let config = CompletionConfig::default();
+                    let options = CompletionOptionsBuilder::default()
+                        .max_decoding_tokens(config.max_decoding_tokens as i32)
+                        .sampling_temperature(0.1)
+                        .seed(0)
+                        .build()
+                        .expect("Failed to build completion options");
+
+                    let (first, _) = completion
+                        .generate("def fib(n):\n", options)
+                        .await
+                        .into_future()
+                        .await;
+
+                    if first.is_some() {
+                        return Ok(ModelBackendHealthInfo {
+                            latency_ms: start.elapsed().as_millis() as i32,
+                        });
+                    }
+
+                    Err(TestModelConnectionError::FailedToConnect(
+                        "Failed to connect to the completion model".into(),
+                    ))
+                } else {
+                    Err(TestModelConnectionError::NotEnabled)
+                }
+            }
+
+            ModelHealthBackend::Chat => {
+                if let Some(chat) = ctx.locator.chat() {
+                    let request = CreateChatCompletionRequestArgs::default()
+                        .messages(vec![ChatCompletionRequestMessage::User(
+                            ChatCompletionRequestUserMessageArgs::default()
+                                .content("Hello, please reply in short")
+                                .build()
+                                .expect("Failed to build chat completion message"),
+                        )])
+                        .build()
+                        .expect("Failed to build chat completion request");
+                    match chat.chat(request).await {
+                        Ok(_) => Ok(ModelBackendHealthInfo {
+                            latency_ms: start.elapsed().as_millis() as i32,
+                        }),
+                        Err(e) => Err(e.into()),
+                    }
+                } else {
+                    Err(TestModelConnectionError::NotEnabled)
+                }
+            }
+            ModelHealthBackend::Embedding => {
+                if let Some(embedding) = ctx.locator.embedding() {
+                    match embedding.embed("hello Tabby").await {
+                        Ok(_) => Ok(ModelBackendHealthInfo {
+                            latency_ms: start.elapsed().as_millis() as i32,
+                        }),
+                        Err(err) => Err(CoreError::Other(err).into()),
+                    }
+                } else {
+                    Err(TestModelConnectionError::NotEnabled)
+                }
+            }
+        }
+    }
+
+    async fn read_repository_related_questions(
+        ctx: &Context,
+        source_id: String,
+    ) -> Result<Vec<String>, CoreError> {
+        let user = check_user(ctx).await?;
+        ctx.locator
+            .repository()
+            .read_repository_related_questions(
+                ctx.locator
+                    .chat()
+                    .ok_or(CoreError::NotFound("The Chat didn't initialize yet"))?,
+                &user.policy,
+                source_id,
+            )
+            .await
+    }
 }
 
 #[derive(GraphQLObject)]
@@ -666,6 +1071,7 @@ pub struct ServerInfo {
     is_chat_enabled: bool,
     is_email_configured: bool,
     allow_self_signup: bool,
+    disable_password_login: bool,
     is_demo_mode: bool,
 }
 
@@ -717,6 +1123,12 @@ impl Mutation {
     }
 
     async fn password_change(ctx: &Context, input: PasswordChangeInput) -> Result<bool> {
+        if is_demo_mode() {
+            return Err(CoreError::Forbidden(
+                "Changing password is disabled in Demo mode.",
+            ));
+        }
+
         let claims = check_claims(ctx)?;
         input.validate()?;
         ctx.locator
@@ -834,6 +1246,22 @@ impl Mutation {
             .await
     }
 
+    async fn token_auth_ldap(
+        ctx: &Context,
+        user_id: String,
+        password: String,
+    ) -> Result<TokenAuthResponse> {
+        let input = auth::TokenAuthLdapInput {
+            user_id: &user_id,
+            password: &password,
+        };
+        input.validate()?;
+        ctx.locator
+            .auth()
+            .token_auth_ldap(&user_id, &password)
+            .await
+    }
+
     async fn verify_token(ctx: &Context, token: String) -> Result<bool> {
         ctx.locator.auth().verify_access_token(&token).await?;
         Ok(true)
@@ -855,14 +1283,34 @@ impl Mutation {
         Ok(true)
     }
 
-    async fn create_git_repository(ctx: &Context, name: String, git_url: String) -> Result<ID> {
+    async fn mark_notifications_read(ctx: &Context, notification_id: Option<ID>) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        ctx.locator
+            .notification()
+            .mark_read(&user.id, notification_id.as_ref())
+            .await?;
+        Ok(true)
+    }
+
+    async fn create_git_repository(
+        ctx: &Context,
+        name: String,
+        git_url: String,
+        refs: Option<Vec<String>>,
+    ) -> Result<ID> {
         check_admin(ctx).await?;
-        let input = repository::CreateGitRepositoryInput { name, git_url };
+        let input = repository::CreateGitRepositoryInput {
+            name,
+            git_url,
+            refs,
+        };
         input.validate()?;
+        let refs = input.refs.unwrap_or_default();
         ctx.locator
             .repository()
             .git()
-            .create(input.name, input.git_url)
+            .create(input.name, input.git_url, refs)
             .await
     }
 
@@ -874,15 +1322,11 @@ impl Mutation {
     async fn update_git_repository(
         ctx: &Context,
         id: ID,
-        name: String,
-        git_url: String,
+        refs: Option<Vec<String>>,
     ) -> Result<bool> {
         check_admin(ctx).await?;
-        ctx.locator
-            .repository()
-            .git()
-            .update(&id, name, git_url)
-            .await
+        let refs = refs.unwrap_or_default();
+        ctx.locator.repository().git().update(&id, refs).await
     }
 
     async fn delete_invitation(ctx: &Context, id: ID) -> Result<ID> {
@@ -907,6 +1351,31 @@ impl Mutation {
         Ok(true)
     }
 
+    async fn test_ldap_connection(ctx: &Context, input: UpdateLdapCredentialInput) -> Result<bool> {
+        check_admin(ctx).await?;
+        check_license(ctx, &[LicenseType::Enterprise]).await?;
+        ctx.locator.auth().test_ldap_connection(input).await?;
+        Ok(true)
+    }
+
+    async fn update_ldap_credential(
+        ctx: &Context,
+        input: UpdateLdapCredentialInput,
+    ) -> Result<bool> {
+        check_admin(ctx).await?;
+        check_license(ctx, &[LicenseType::Enterprise]).await?;
+        input.validate()?;
+
+        ctx.locator.auth().update_ldap_credential(input).await?;
+        Ok(true)
+    }
+
+    async fn delete_ldap_credential(ctx: &Context) -> Result<bool> {
+        check_admin(ctx).await?;
+        ctx.locator.auth().delete_ldap_credential().await?;
+        Ok(true)
+    }
+
     async fn update_email_setting(ctx: &Context, input: EmailSettingInput) -> Result<bool> {
         check_admin(ctx).await?;
         input.validate()?;
@@ -926,6 +1395,18 @@ impl Mutation {
         check_admin(ctx).await?;
         input.validate()?;
         ctx.locator.setting().update_network_setting(input).await?;
+        Ok(true)
+    }
+
+    async fn update_branding_setting(
+        ctx: &Context,
+        input: setting::BrandingSettingInput,
+    ) -> Result<bool> {
+        check_admin(ctx).await?;
+        let license = ctx.locator.license().read().await?;
+        license.ensure_available_features(license::LicenseFeature::CustomLogo)?;
+        input.validate()?;
+        ctx.locator.setting().update_branding_setting(input).await?;
         Ok(true)
     }
 
@@ -992,12 +1473,27 @@ impl Mutation {
         ctx: &Context,
         id: ID,
         active: bool,
+        refs: Option<Vec<String>>,
     ) -> Result<bool> {
         check_admin(ctx).await?;
         ctx.locator
             .repository()
             .third_party()
-            .update_repository_active(id, active)
+            .update_repository_active(id, active, refs)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_integrated_repository_refs(
+        ctx: &Context,
+        id: ID,
+        refs: Vec<String>,
+    ) -> Result<bool> {
+        check_admin(ctx).await?;
+        ctx.locator
+            .repository()
+            .third_party()
+            .update_repository_refs(id, refs)
             .await?;
         Ok(true)
     }
@@ -1030,9 +1526,22 @@ impl Mutation {
         Ok(true)
     }
 
+    async fn delete_thread(ctx: &Context, id: ID) -> Result<bool> {
+        let user = check_user_allow_auth_token(ctx).await?;
+        let svc = ctx.locator.thread();
+        let Some(thread) = svc.get(&id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
+
+        user.policy.check_delete_thread(&thread.user_id)?;
+
+        ctx.locator.thread().delete(&id).await?;
+        Ok(true)
+    }
+
     /// Turn on persisted status for a thread.
     async fn set_thread_persisted(ctx: &Context, thread_id: ID) -> Result<bool> {
-        let user = check_user(ctx).await?;
+        let user = check_user_allow_auth_token(ctx).await?;
         let svc = ctx.locator.thread();
         let Some(thread) = svc.get(&thread_id).await? else {
             return Err(CoreError::NotFound("Thread not found"));
@@ -1043,6 +1552,165 @@ impl Mutation {
 
         ctx.locator.thread().set_persisted(&thread_id).await?;
         Ok(true)
+    }
+
+    async fn update_thread_message(
+        ctx: &Context,
+        input: thread::UpdateMessageInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+        input.validate()?;
+
+        let svc = ctx.locator.thread();
+        let Some(thread) = svc.get(&input.thread_id).await? else {
+            return Err(CoreError::NotFound("Thread not found"));
+        };
+
+        user.policy.check_update_thread_message(&thread.user_id)?;
+
+        svc.update_thread_message(&input).await?;
+        Ok(true)
+    }
+
+    // page mutations
+    async fn update_page_title(ctx: &Context, input: UpdatePageTitleInput) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let page = page_service.get(&input.id).await?;
+
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service.update_title(&input.id, &input.title).await?;
+        Ok(true)
+    }
+
+    async fn update_page_content(ctx: &Context, input: UpdatePageContentInput) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let page = page_service.get(&input.id).await?;
+
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service
+            .update_content(&input.id, &input.content)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_page_section_title(
+        ctx: &Context,
+        input: UpdatePageSectionTitleInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let section = page_service.get_section(&input.id).await?;
+
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service
+            .update_section_title(&input.id, &input.title)
+            .await?;
+        Ok(true)
+    }
+
+    async fn update_page_section_content(
+        ctx: &Context,
+        input: UpdatePageSectionContentInput,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        input.validate()?;
+
+        let section = page_service.get_section(&input.id).await?;
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+        page_service
+            .update_section_content(&input.id, &input.content)
+            .await?;
+        Ok(true)
+    }
+
+    /// delete a page and all its sections.
+    async fn delete_page(ctx: &Context, id: ID) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        let page = page_service.get(&id).await?;
+
+        user.policy.check_update_page(&page.author_id)?;
+        page_service.delete(&id).await.map(|_| true)
+    }
+
+    /// delete a single page section.
+    async fn delete_page_section(ctx: &Context, section_id: ID) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+        let section = page_service.get_section(&section_id).await?;
+
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service.delete_section(&section_id).await.map(|_| true)
+    }
+
+    async fn move_page_section(
+        ctx: &Context,
+        id: ID,
+        direction: page::MoveSectionDirection,
+    ) -> Result<bool> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        let section = page_service.get_section(&id).await?;
+        let page = page_service.get(&section.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service
+            .move_section(&page.id, &id, direction)
+            .await
+            .map(|_| true)
     }
 
     async fn create_custom_document(ctx: &Context, input: CreateCustomDocumentInput) -> Result<ID> {
@@ -1154,19 +1822,10 @@ fn from_validation_errors<S: ScalarValue>(error: ValidationErrors) -> FieldError
 
     error.errors().iter().for_each(|(field, kind)| match kind {
         validator::ValidationErrorsKind::Struct(e) => {
-            for (_, error) in e.0.iter() {
-                if let validator::ValidationErrorsKind::Field(field_errors) = error {
-                    for error in field_errors {
-                        let mut obj = Object::with_capacity(2);
-                        obj.add_field("path", Value::scalar(field.to_string()));
-                        obj.add_field(
-                            "message",
-                            Value::scalar(error.message.clone().unwrap_or_default().to_string()),
-                        );
-                        errors.push(obj.into());
-                    }
-                }
-            }
+            let mut obj = Object::with_capacity(2);
+            obj.add_field("path", field.to_string().into());
+            obj.add_field("message", Value::scalar(e.to_string()));
+            errors.push(obj.into());
         }
         validator::ValidationErrorsKind::List(_) => {
             warn!("List errors are not handled");
@@ -1211,7 +1870,7 @@ impl Subscription {
 
         thread
             .create_run(
-                &user.policy,
+                &user,
                 &thread_id,
                 &input.options,
                 input.thread.user_message.attachments.as_ref(),
@@ -1243,7 +1902,7 @@ impl Subscription {
             .await?;
 
         svc.create_run(
-            &user.policy,
+            &user,
             &input.thread_id,
             &input.options,
             input.additional_user_message.attachments.as_ref(),
@@ -1251,6 +1910,59 @@ impl Subscription {
             false,
         )
         .await
+    }
+
+    async fn create_page_run(ctx: &Context, input: CreatePageRunInput) -> Result<PageRunStream> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        page_service
+            .create_run(&user.policy, &user.id, &input)
+            .await
+    }
+
+    /// Utilize an existing thread and its messages to create a page.
+    /// This will automatically generate:
+    /// - the page title and a summary of the content.
+    /// - a few sections based on the thread messages.
+    async fn create_thread_to_page_run(
+        ctx: &Context,
+        input: CreateThreadToPageRunInput,
+    ) -> Result<ThreadToPageRunStream> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        page_service
+            .convert_thread_to_page(&user.policy, &user.id, &input)
+            .await
+    }
+
+    async fn create_page_section_run(
+        ctx: &Context,
+        input: CreatePageSectionRunInput,
+    ) -> Result<SectionRunStream> {
+        let user = check_user(ctx).await?;
+
+        let page_service = if let Some(service) = ctx.locator.page() {
+            service
+        } else {
+            return Err(CoreError::Forbidden("Page service is not enabled"));
+        };
+
+        let page = page_service.get(&input.page_id).await?;
+        user.policy.check_update_page(&page.author_id)?;
+
+        page_service.append_section(&user.policy, &input).await
     }
 }
 

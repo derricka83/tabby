@@ -1,30 +1,31 @@
 # OpenAI
 
-OpenAI is a leading AI company that has developed a range of language models. Tabby supports OpenAI's models for chat and embedding tasks.
+OpenAI is a leading AI company that has developed an extensive range of language models. Their API specifications have become a de facto standard, also implemented by other vendors such as vLLM, Nvidia NIM, and LocalAI.
 
-Tabby also supports its legacy `/v1/completions` API for code completion, although **OpenAI itself no longer supports it**; it is still the API offered by some other vendors, such as (vLLM, Nvidia NIM, LocalAI, ...).
+## Chat model
 
-Below is an example configuration:
+OpenAI provides a comprehensive chat API interface. Note: Do not append the `/chat/completions` suffix to the API endpoint.
 
 ```toml title="~/.tabby/config.toml"
-# Completion model
-[model.completion.http]
-kind = "openai/completion"
-model_name = "your_model"
-api_endpoint = "https://url_to_your_backend_or_service"
-api_key = "secret-api-key"
-
-# Chat model
 [model.chat.http]
 kind = "openai/chat"
-model_name = "gpt-3.5-turbo"
-api_endpoint = "https://api.openai.com/v1"
-api_key = "secret-api-key"
+model_name = "gpt-4o"  # Please make sure to use a chat model, such as gpt-4o
+api_endpoint = "https://api.openai.com/v1"   # DO NOT append the `/chat/completions` suffix
+api_key = "your-api-key"
+```
 
-# Embedding model
+## Completion model
+
+OpenAI doesn't offer models for completions (FIM), its `/v1/completions` API has been deprecated.
+
+## Embeddings model
+
+OpenAI provides powerful embedding models through their API interface. Note: Do not append the `/embeddings` suffix to the API endpoint.
+
+```toml title="~/.tabby/config.toml"
 [model.embedding.http]
 kind = "openai/embedding"
-model_name = "text-embedding-3-small"
-api_endpoint = "https://api.openai.com/v1"
-api_key = "secret-api-key"
+model_name = "text-embedding-3-small"  # Please make sure to use a embedding model, such as text-embedding-3-small
+api_endpoint = "https://api.openai.com/v1"  # DO NOT append the `/embeddings` suffix
+api_key = "your-api-key"
 ```

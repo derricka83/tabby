@@ -27,7 +27,7 @@ axum-extra = {workspace = true, features = ["typed-header"]}
 hyper = { workspace = true }
 tokio = { workspace = true }
 utoipa = { workspace = true, features = ["axum_extras", "preserve_order"] }
-utoipa-swagger-ui = { version = "6", features = ["axum"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 serde = { workspace = true }
 serdeconv = { workspace = true }
 serde_json = { workspace = true }
@@ -38,9 +38,14 @@ strum = { workspace = true }
 strfmt = "0.2.4"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
 tantivy = { workspace = true }
 anyhow = { workspace = true }
-sysinfo = "0.29.8"
+sysinfo = "0.33.0"
 nvml-wrapper = "0.9.0"
 http-api-bindings = { path = "../http-api-bindings" }
 async-stream = { workspace = true }
@@ -54,8 +59,9 @@ axum-prometheus = "0.6"
 uuid.workspace = true
 color-eyre = { version = "0.6.3" }
 reqwest.workspace = true
-async-openai.workspace = true
+async-openai-alt.workspace = true
 spinners = "4.1.1"
+regex.workspace = true
 
 [dependencies.openssl]
 optional = true

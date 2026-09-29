@@ -1,6 +1,15 @@
-use std::{env::var, net::TcpListener, process::Stdio};
+use std::{
+    collections::VecDeque,
+    env::var,
+    net::TcpListener,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
-use tokio::{io::AsyncBufReadExt, task::JoinHandle};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    task::JoinHandle,
+};
 use tracing::{debug, warn};
 use which::which;
 
@@ -29,6 +38,9 @@ impl LlamaCppSupervisor {
 
         let model_path = model_path.to_owned();
         let port = get_available_port();
+        let mut retry_count = 0;
+        let initial_time = Instant::now();
+
         let handle = tokio::spawn(async move {
             loop {
                 let server_binary = std::env::current_exe()
@@ -48,7 +60,6 @@ impl LlamaCppSupervisor {
                     .arg(port.to_string())
                     .arg("-np")
                     .arg(parallelism.to_string())
-                    .arg("--log-disable")
                     .arg("--ctx-size")
                     .arg(context_size.to_string())
                     .kill_on_drop(true)
@@ -87,30 +98,71 @@ impl LlamaCppSupervisor {
                     )
                 });
 
-                let status_code = process
-                    .wait()
-                    .await
-                    .ok()
-                    .and_then(|s| s.code())
-                    .unwrap_or(-1);
+                let mut stderr = BufReader::new(
+                    process
+                        .stderr
+                        .take()
+                        .expect("Failed to get llama.cpp stderr"),
+                )
+                .lines();
+                let mut error_lines = VecDeque::with_capacity(100);
+
+                let wait_handle = process.wait();
+
+                while let Ok(Some(line)) = stderr.next_line().await {
+                    if !line.contains("GET /health") {
+                        if error_lines.len() >= 100 {
+                            error_lines.pop_front();
+                        }
+                        error_lines.push_back(line);
+                    }
+                }
+
+                let status_code = wait_handle.await.ok().and_then(|s| s.code()).unwrap_or(-1);
 
                 if status_code != 0 {
                     warn!(
                         "llama-server <{}> exited with status code {}, args: `{}`",
                         name, status_code, command_args
                     );
-                    let mut stderr = process
-                        .stderr
-                        .take()
-                        .map(tokio::io::BufReader::new)
-                        .map(|reader| reader.lines())
-                        .expect("Failed to read stderr");
 
-                    while let Ok(Some(line)) = stderr.next_line().await {
-                        warn!("<{}>: {}", name, line);
+                    // print only the initial round error message.
+                    if retry_count == 0 {
+                        eprintln!(
+                            "{}\n",
+                            tabby_common::terminal::HeaderFormat::BoldRed
+                                .format("Recent llama-cpp errors:")
+                        );
+                    }
+                    for line in error_lines {
+                        // print only the initial round error message.
+                        if retry_count == 0 {
+                            eprintln!("{}", line);
+                        }
+                        if let Some(solution) = analyze_error_message(&line) {
+                            let solution_lines: Vec<_> = solution.split('\n').collect();
+                            let msg = tabby_common::terminal::InfoMessage::new(
+                                "ERROR",
+                                tabby_common::terminal::HeaderFormat::BoldRed,
+                                &solution_lines,
+                            );
+                            msg.print();
+                            break;
+                        }
                     }
 
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    // exit only after the retry loop has been exhausted 5 times and Tabby was initialing for fewer than 1 minute.
+                    if retry_count >= 5 && initial_time.elapsed().as_secs() < 60 {
+                        eprintln!(
+                            "llama-server <{}> encountered a fatal error. Exiting service. Please check the above logs and suggested solutions for details.",
+                            name
+                        );
+                        std::process::exit(1);
+                    }
+
+                    retry_count += 1;
+                    warn!("Attempting to restart the llama-server...");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
         });
@@ -126,7 +178,14 @@ impl LlamaCppSupervisor {
         debug!("Waiting for llama-server <{}> to start...", self.name);
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         loop {
-            let Ok(resp) = client.get(api_endpoint(self.port) + "/health").send().await else {
+            let Ok(resp) = client
+                .get(api_endpoint(self.port) + "/health")
+                .timeout(Duration::from_secs(1))
+                .send()
+                .await
+            else {
+                debug!("llama-server <{}> not ready yet, retrying...", self.name);
+                tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             };
 
@@ -136,6 +195,30 @@ impl LlamaCppSupervisor {
             }
         }
     }
+}
+
+fn analyze_error_message(error_message: &str) -> Option<String> {
+    if error_message.contains("cudaMalloc") {
+        return Some(String::from(
+            "CUDA memory allocation error detected:\n\
+             1. Try using a smaller Model\n\
+             2. Try to reduce GPU memory usage\n",
+        ));
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if error_message.contains("Illegal instruction")
+            && !std::arch::is_x86_feature_detected!("avx2")
+        {
+            return Some(String::from(
+                "Illegal instruction detected: Your CPU does not support AVX2 instruction set.\n\
+                 Suggestion: Download a compatible binary from https://github.com/ggml-org/llama.cpp/releases"
+            ));
+        }
+    }
+
+    None
 }
 
 fn find_binary_name() -> Option<String> {

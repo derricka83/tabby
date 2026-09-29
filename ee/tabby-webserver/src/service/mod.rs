@@ -5,16 +5,22 @@ mod auth;
 pub mod background_job;
 pub mod context;
 mod email;
+pub mod embedding;
 pub mod event_logger;
+pub mod ingestion;
 pub mod integration;
 pub mod job;
 mod license;
+mod notification;
+mod page;
 mod preset_web_documents_data;
 pub mod repository;
+pub mod retrieval;
 mod setting;
 mod thread;
 mod user_event;
 mod user_group;
+pub mod utils;
 pub mod web_documents;
 
 use std::sync::Arc;
@@ -22,31 +28,41 @@ use std::sync::Arc;
 use answer::AnswerService;
 use anyhow::Context;
 use async_trait::async_trait;
+pub use auth::create as new_auth_service;
+#[cfg(test)]
+pub use auth::testutils::FakeAuthService;
 use axum::{
     body::Body,
     http::{HeaderName, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::IntoResponse,
 };
+pub use email::new_email_service;
 use hyper::{HeaderMap, Uri};
 use juniper::ID;
+pub use license::new_license_service;
+pub use setting::create as new_setting_service;
 use tabby_common::{
     api::{code::CodeSearch, event::EventLogger},
+    config::PageConfig,
     constants::USER_HEADER_FIELD_NAME,
 };
 use tabby_db::{DbConn, UserDAO, UserGroupDAO};
-use tabby_inference::Embedding;
+use tabby_inference::{ChatCompletionStream, CompletionStream, Embedding as EmbeddingService};
 use tabby_schema::{
     access_policy::AccessPolicyService,
     analytic::AnalyticService,
     auth::{AuthenticationService, UserSecured},
     context::ContextService,
     email::EmailService,
+    ingestion::IngestionService,
     integration::IntegrationService,
     interface::UserValue,
     is_demo_mode,
     job::JobService,
     license::{IsLicenseValid, LicenseService},
+    notification::NotificationService,
+    page::PageService,
     policy,
     repository::RepositoryService,
     setting::SettingService,
@@ -58,61 +74,86 @@ use tabby_schema::{
     AsID, AsRowid, CoreError, Result, ServiceLocator,
 };
 
-use self::{
-    analytic::new_analytic_service, email::new_email_service, license::new_license_service,
-};
+use self::analytic::new_analytic_service;
+use crate::{rate_limit::UserRateLimiter, service::retrieval::RetrievalService};
+
 struct ServerContext {
     db_conn: DbConn,
     mail: Arc<dyn EmailService>,
+    embedding: Option<Arc<dyn EmbeddingService>>,
+    chat: Option<Arc<dyn ChatCompletionStream>>,
+    completion: Option<Arc<dyn CompletionStream>>,
+
     auth: Arc<dyn AuthenticationService>,
+    notification: Arc<dyn NotificationService>,
     license: Arc<dyn LicenseService>,
     repository: Arc<dyn RepositoryService>,
     integration: Arc<dyn IntegrationService>,
     user_event: Arc<dyn UserEventService>,
+    ingestion: Arc<dyn IngestionService>,
     job: Arc<dyn JobService>,
     web_documents: Arc<dyn WebDocumentService>,
     thread: Arc<dyn ThreadService>,
+    page: Option<Arc<dyn PageService>>,
     context: Arc<dyn ContextService>,
     user_group: Arc<dyn UserGroupService>,
     access_policy: Arc<dyn AccessPolicyService>,
 
     logger: Arc<dyn EventLogger>,
-    code: Arc<dyn CodeSearch>,
+    code: Option<Arc<dyn CodeSearch>>,
 
     setting: Arc<dyn SettingService>,
 
-    is_chat_enabled_locally: bool,
+    user_rate_limiter: UserRateLimiter,
 }
 
 impl ServerContext {
     pub async fn new(
         logger: Arc<dyn EventLogger>,
-        code: Arc<dyn CodeSearch>,
+        auth: Arc<dyn AuthenticationService>,
+        chat: Option<Arc<dyn ChatCompletionStream>>,
+        completion: Option<Arc<dyn CompletionStream>>,
+        code: Option<Arc<dyn CodeSearch>>,
         repository: Arc<dyn RepositoryService>,
         integration: Arc<dyn IntegrationService>,
+        ingestion: Arc<dyn IngestionService>,
         job: Arc<dyn JobService>,
         answer: Option<Arc<AnswerService>>,
+        retrieval: Arc<retrieval::RetrievalService>,
         context: Arc<dyn ContextService>,
         web_documents: Arc<dyn WebDocumentService>,
+        mail: Arc<dyn EmailService>,
+        license: Arc<dyn LicenseService>,
+        setting: Arc<dyn SettingService>,
         db_conn: DbConn,
-        embedding: Arc<dyn Embedding>,
-        is_chat_enabled_locally: bool,
+        embedding: Option<Arc<dyn EmbeddingService>>,
     ) -> Self {
-        let mail = Arc::new(
-            new_email_service(db_conn.clone())
-                .await
-                .expect("failed to initialize mail service"),
-        );
-        let license = Arc::new(
-            new_license_service(db_conn.clone())
-                .await
-                .expect("failed to initialize license service"),
-        );
         let user_event = Arc::new(user_event::create(db_conn.clone()));
-        let setting = Arc::new(setting::create(db_conn.clone()));
-        let thread = Arc::new(thread::create(db_conn.clone(), answer.clone()));
+
+        let thread = Arc::new(thread::create(
+            db_conn.clone(),
+            answer.clone(),
+            Some(auth.clone()),
+            context.clone(),
+        ));
+        let page = chat.as_ref().and_then(|chat| {
+            answer.as_ref().map(|answer| {
+                Arc::new(page::create(
+                    PageConfig::default(),
+                    db_conn.clone(),
+                    auth.clone(),
+                    chat.clone(),
+                    thread.clone(),
+                    context.clone(),
+                    retrieval.clone(),
+                    answer.clone(),
+                )) as Arc<dyn PageService>
+            })
+        });
+
         let user_group = Arc::new(user_group::create(db_conn.clone()));
         let access_policy = Arc::new(access_policy::create(db_conn.clone(), context.clone()));
+        let notification = Arc::new(notification::create(db_conn.clone()));
 
         background_job::start(
             db_conn.clone(),
@@ -120,35 +161,40 @@ impl ServerContext {
             repository.git(),
             repository.third_party(),
             integration.clone(),
+            ingestion.clone(),
             repository.clone(),
+            page.clone(),
             context.clone(),
-            embedding,
+            license.clone(),
+            notification.clone(),
+            embedding.clone(),
         )
         .await;
 
         Self {
-            mail: mail.clone(),
-            auth: Arc::new(auth::create(
-                db_conn.clone(),
-                mail,
-                license.clone(),
-                setting.clone(),
-            )),
+            mail,
+            embedding,
+            chat,
+            completion,
+            auth,
             web_documents,
             thread,
+            page,
             context,
             license,
             repository,
             integration,
             user_event,
+            ingestion,
             job,
             logger,
             code,
             setting,
             user_group,
             access_policy,
+            notification,
             db_conn,
-            is_chat_enabled_locally,
+            user_rate_limiter: UserRateLimiter::default(),
         }
     }
 
@@ -219,6 +265,19 @@ impl WorkerService for ServerContext {
         }
 
         if let Some(user) = user {
+            // Apply rate limiting when `user` is not none.
+            if !self
+                .user_rate_limiter
+                .is_allowed(request.uri(), &user)
+                .await
+            {
+                return axum::response::Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .body(Body::empty())
+                    .unwrap()
+                    .into_response();
+            }
+
             request.headers_mut().append(
                 HeaderName::from_static(USER_HEADER_FIELD_NAME),
                 HeaderValue::from_str(&user).expect("User must be valid header"),
@@ -241,7 +300,7 @@ impl WorkerService for ServerContext {
     }
 
     async fn is_chat_enabled(&self) -> Result<bool> {
-        Ok(self.is_chat_enabled_locally)
+        Ok(self.chat.is_some())
     }
 }
 
@@ -258,16 +317,32 @@ impl ServiceLocator for ArcServerContext {
         self.0.auth.clone()
     }
 
+    fn chat(&self) -> Option<Arc<dyn ChatCompletionStream>> {
+        self.0.chat.clone()
+    }
+
     fn worker(&self) -> Arc<dyn WorkerService> {
         self.0.clone()
     }
 
-    fn code(&self) -> Arc<dyn CodeSearch> {
+    fn code(&self) -> Option<Arc<dyn CodeSearch>> {
         self.0.code.clone()
+    }
+
+    fn completion(&self) -> Option<Arc<dyn CompletionStream>> {
+        self.0.completion.clone()
     }
 
     fn logger(&self) -> Arc<dyn EventLogger> {
         self.0.logger.clone()
+    }
+
+    fn notification(&self) -> Arc<dyn tabby_schema::notification::NotificationService> {
+        self.0.notification.clone()
+    }
+
+    fn ingestion(&self) -> Arc<dyn IngestionService> {
+        self.0.ingestion.clone()
     }
 
     fn job(&self) -> Arc<dyn JobService> {
@@ -280,6 +355,10 @@ impl ServiceLocator for ArcServerContext {
 
     fn email(&self) -> Arc<dyn EmailService> {
         self.0.mail.clone()
+    }
+
+    fn embedding(&self) -> Option<Arc<dyn EmbeddingService>> {
+        self.0.embedding.clone()
     }
 
     fn setting(&self) -> Arc<dyn SettingService> {
@@ -310,6 +389,10 @@ impl ServiceLocator for ArcServerContext {
         self.0.thread.clone()
     }
 
+    fn page(&self) -> Option<Arc<dyn PageService>> {
+        self.0.page.clone()
+    }
+
     fn context(&self) -> Arc<dyn ContextService> {
         self.0.context.clone()
     }
@@ -325,30 +408,44 @@ impl ServiceLocator for ArcServerContext {
 
 pub async fn create_service_locator(
     logger: Arc<dyn EventLogger>,
-    code: Arc<dyn CodeSearch>,
+    auth: Arc<dyn AuthenticationService>,
+    chat: Option<Arc<dyn ChatCompletionStream>>,
+    completion: Option<Arc<dyn CompletionStream>>,
+    code: Option<Arc<dyn CodeSearch>>,
     repository: Arc<dyn RepositoryService>,
     integration: Arc<dyn IntegrationService>,
+    ingestion: Arc<dyn IngestionService>,
     job: Arc<dyn JobService>,
     answer: Option<Arc<AnswerService>>,
+    retrieval: Arc<RetrievalService>,
     context: Arc<dyn ContextService>,
     web_documents: Arc<dyn WebDocumentService>,
+    mail: Arc<dyn EmailService>,
+    license: Arc<dyn LicenseService>,
+    setting: Arc<dyn SettingService>,
     db: DbConn,
-    embedding: Arc<dyn Embedding>,
-    is_chat_enabled: bool,
+    embedding: Option<Arc<dyn EmbeddingService>>,
 ) -> Arc<dyn ServiceLocator> {
     Arc::new(ArcServerContext::new(
         ServerContext::new(
             logger,
+            auth,
+            chat,
+            completion,
             code,
             repository,
             integration,
+            ingestion,
             job,
             answer,
+            retrieval,
             context,
             web_documents,
+            mail,
+            license,
+            setting,
             db,
             embedding,
-            is_chat_enabled,
         )
         .await,
     ))
@@ -412,6 +509,11 @@ impl UserSecuredExt for tabby_schema::auth::UserSecured {
             created_at: val.created_at,
             active: val.active,
             is_password_set: val.password_encrypted.is_some(),
+
+            // when a user created by registration, password_encrypted is set
+            // when a user created by SSO, password_encrypted is not set
+            // so, we can determine if a user is SSO user by checking if password_encrypted is set
+            is_sso_user: val.password_encrypted.is_none(),
         }
     }
 }

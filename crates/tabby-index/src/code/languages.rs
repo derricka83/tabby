@@ -49,6 +49,17 @@ lazy_static! {
                 ),
             ),
             (
+                "scala",
+                TagsConfigurationSync(
+                    TagsConfiguration::new(
+                        tree_sitter_scala::language(),
+                        include_str!("../../queries/scala.scm"),
+                        "",
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
                 "kotlin",
                 TagsConfigurationSync(
                     TagsConfiguration::new(
@@ -153,6 +164,17 @@ lazy_static! {
                     TagsConfiguration::new(
                         tree_sitter_lua::language(),
                         tree_sitter_lua::TAGS_QUERY,
+                        "",
+                    )
+                    .unwrap(),
+                ),
+            ),
+            (
+                "gdscript",
+                TagsConfigurationSync(
+                    TagsConfiguration::new(
+                        tree_sitter_gdscript::language(),
+                        include_str!("../../queries/gdscript.scm"),
                         "",
                     )
                     .unwrap(),

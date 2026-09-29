@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::{bail, Result};
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -10,7 +11,7 @@ use tabby_common::{
 };
 use tabby_inference::Embedding;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info_span, warn, Instrument};
 
 use self::intelligence::SourceCode;
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
 
 //  Modules for creating code search index.
 mod index;
-mod intelligence;
+pub mod intelligence;
 mod languages;
 mod repository;
 mod types;
@@ -33,12 +34,12 @@ impl CodeIndexer {
         embedding: Arc<dyn Embedding>,
         repository: &CodeRepository,
     ) -> anyhow::Result<()> {
+        repository::sync_repository(repository)?;
+
         logkit::info!(
             "Building source code index: {}",
             repository.canonical_git_url()
         );
-        repository::sync_repository(repository)?;
-
         index::index_repository(embedding, repository).await;
         index::garbage_collection().await;
 
@@ -61,14 +62,16 @@ impl CodeBuilder {
 
 #[async_trait]
 impl IndexAttributeBuilder<SourceCode> for CodeBuilder {
-    async fn build_attributes(&self, _source_code: &SourceCode) -> serde_json::Value {
-        json!({})
+    async fn build_attributes(&self, source_code: &SourceCode) -> serde_json::Value {
+        json!({
+            code::fields::COMMIT: source_code.commit,
+        })
     }
 
-    async fn build_chunk_attributes(
+    async fn build_chunk_attributes<'a>(
         &self,
-        source_code: &SourceCode,
-    ) -> BoxStream<JoinHandle<(Vec<String>, serde_json::Value)>> {
+        source_code: &'a SourceCode,
+    ) -> BoxStream<'a, JoinHandle<Result<(Vec<String>, serde_json::Value)>>> {
         let text = match source_code.read_content() {
             Ok(content) => content,
             Err(e) => {
@@ -77,30 +80,46 @@ impl IndexAttributeBuilder<SourceCode> for CodeBuilder {
                     source_code.filepath, e
                 );
 
-                return Box::pin(futures::stream::empty());
+                return Box::pin(stream! {
+                    let path = source_code.filepath.clone();
+                    yield tokio::spawn(async move {
+                        bail!("Failed to read content of '{}': {}", path, e);
+                    });
+                });
             }
         };
 
         let Some(embedding) = self.embedding.clone() else {
             warn!("No embedding service found for code indexing");
-            return Box::pin(futures::stream::empty());
+            return Box::pin(stream! {
+                yield tokio::spawn(async move {
+                    bail!("No embedding service found for code indexing");
+                });
+            });
         };
 
         let source_code = source_code.clone();
         let s = stream! {
             for await (start_line, body) in CodeIntelligence::chunks(&text, &source_code.language) {
-                let attributes = json!({
+                let mut attributes = json!({
                     code::fields::CHUNK_FILEPATH: source_code.filepath,
                     code::fields::CHUNK_GIT_URL: source_code.git_url,
                     code::fields::CHUNK_LANGUAGE: source_code.language,
-                    code::fields::CHUNK_BODY:  body,
-                    code::fields::CHUNK_START_LINE: start_line,
+                    code::fields::CHUNK_BODY: body,
                 });
 
+                // When text length is not equal to body length, it means this chunk is not the entire
+                // content of the file, thus we need to record the start line.
+                if text.len() != body.len() {
+                    attributes[code::fields::CHUNK_START_LINE] = start_line.into();
+                }
                 let embedding = embedding.clone();
+                let rewritten_body = format!("```{}\n{}\n```", source_code.filepath, body);
                 yield tokio::spawn(async move {
-                    let tokens = build_binarize_embedding_tokens(embedding.clone(), &body).await;
-                    (tokens, attributes)
+                    match build_binarize_embedding_tokens(embedding.clone(), &rewritten_body).await {
+                        Ok(tokens) => Ok((tokens, attributes)),
+                        Err(err) => Err(err),
+                    }
                 });
             }
         };
@@ -109,12 +128,18 @@ impl IndexAttributeBuilder<SourceCode> for CodeBuilder {
     }
 }
 
-async fn build_binarize_embedding_tokens(embedding: Arc<dyn Embedding>, body: &str) -> Vec<String> {
-    let embedding = match embedding.embed(body).await {
+async fn build_binarize_embedding_tokens(
+    embedding: Arc<dyn Embedding>,
+    body: &str,
+) -> Result<Vec<String>> {
+    let embedding = match embedding
+        .embed(body)
+        .instrument(info_span!("index_compute_embedding", corpus = corpus::CODE))
+        .await
+    {
         Ok(x) => x,
         Err(err) => {
-            warn!("Failed to embed chunk text: {}", err);
-            return Vec::new();
+            bail!("Failed to embed chunk text: {}", err);
         }
     };
 
@@ -123,10 +148,10 @@ async fn build_binarize_embedding_tokens(embedding: Arc<dyn Embedding>, body: &s
         tokens.push(token);
     }
 
-    tokens
+    Ok(tokens)
 }
 
-fn create_code_builder(embedding: Option<Arc<dyn Embedding>>) -> TantivyDocBuilder<SourceCode> {
+pub fn create_code_builder(embedding: Option<Arc<dyn Embedding>>) -> TantivyDocBuilder<SourceCode> {
     let builder = CodeBuilder::new(embedding);
     TantivyDocBuilder::new(corpus::CODE, builder)
 }

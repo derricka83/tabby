@@ -1,6 +1,7 @@
 :8080 {
 	rewrite /files/* /files
 	rewrite /search/* /search
+	rewrite /pages/* /pages
 
 	@backend {
 		path /graphql
@@ -14,6 +15,7 @@
 		path /oauth/*
 		path /avatar/*
 		path /integrations/github/*
+		path /background-jobs/*
 
 		path /swagger-ui
 		path /swagger-ui/*

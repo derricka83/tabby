@@ -44,6 +44,13 @@ export type ConfigData = {
           overlapLines: number;
         };
       };
+      collectSnippetsFromRecentOpenedFiles: {
+        enabled: boolean;
+        //max number of opened files
+        maxOpenedFiles: number;
+        //chars size per each opened file
+        maxCharsPerOpenedFiles: number;
+      };
       clipboard: {
         minChars: number;
         maxChars: number;
@@ -71,6 +78,11 @@ export type ConfigData = {
     edit: {
       documentMaxChars: number;
       commandMaxChars: number;
+      fileContext: {
+        maxFiles: number;
+        maxCharsPerFile: number;
+        promptTemplate: [string, string];
+      };
       responseDocumentTag: string[];
       responseCommentTag: string[] | undefined;
       promptTemplate: {
@@ -91,6 +103,16 @@ export type ConfigData = {
       maxDiffLength: number;
       promptTemplate: string;
       responseMatcher: string;
+    };
+    generateBranchName: {
+      maxDiffLength: number;
+      promptTemplate: string;
+    };
+    smartApplyLineRange: {
+      promptTemplate: string;
+    };
+    smartApply: {
+      promptTemplate: string;
     };
   };
   logs: {

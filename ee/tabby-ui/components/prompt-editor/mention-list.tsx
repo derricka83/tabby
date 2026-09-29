@@ -9,10 +9,10 @@ import React, {
   useRef,
   useState
 } from 'react'
-import {
+import type {
   SuggestionKeyDownProps,
   SuggestionProps
-} from '@tiptap/extension-mention/dist/packages/suggestion/src/index.d'
+} from '@tiptap/suggestion'
 import { go as fuzzy } from 'fuzzysort'
 
 import { ContextSourceKind } from '@/lib/gql/generates/graphql'
@@ -22,6 +22,7 @@ import {
   IconCode,
   IconEmojiBook,
   IconEmojiGlobe,
+  IconFolderUp,
   IconGitHub,
   IconGitLab,
   IconSpinner
@@ -168,6 +169,8 @@ function OptionIcon({ kind }: { kind: ContextSourceKind }) {
       return <IconEmojiBook />
     case ContextSourceKind.Web:
       return <IconEmojiGlobe />
+    case ContextSourceKind.Ingested:
+      return <IconFolderUp />
     case ContextSourceKind.Git:
       return <IconCode />
     case ContextSourceKind.Github:

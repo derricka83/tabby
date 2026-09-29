@@ -7,11 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::indexer::{IndexId, ToIndexId};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SourceCode {
     pub source_file_id: String,
     pub source_id: String,
     pub git_url: String,
+    pub commit: String,
     pub basedir: String,
     pub filepath: String,
     pub language: String,
@@ -48,7 +49,7 @@ impl SourceCode {
             source_id: source_id.to_owned(),
             // Source file id might be duplicated across different source_ids, we prefix it with
             // source_id to make it unique within corpus.
-            id: format!("{}:::{}", source_id, source_file_id),
+            id: format!("{source_id}:::{source_file_id}"),
         }
     }
 }

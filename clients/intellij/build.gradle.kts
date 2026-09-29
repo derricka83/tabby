@@ -18,7 +18,12 @@ repositories {
 dependencies {
   intellijPlatform {
     intellijIdeaCommunity("2023.1")
-    bundledPlugins(listOf("Git4Idea"))
+    bundledPlugins(
+      listOf(
+        "Git4Idea",
+        "org.jetbrains.kotlin",
+      )
+    )
     pluginVerifier()
     zipSigner()
     instrumentationTools()
@@ -39,7 +44,7 @@ tasks {
 
   intellijPlatform {
     pluginConfiguration {
-      version.set("1.8.0-dev")
+      version.set("1.14.0-dev")
       changeNotes.set(provider {
         changelog.renderItem(
           changelog.getLatest(),
@@ -48,7 +53,7 @@ tasks {
       })
       ideaVersion {
         sinceBuild.set("231")
-        untilBuild.set("242.*")
+        untilBuild.set(provider { null })
       }
     }
     pluginVerification {
@@ -66,14 +71,16 @@ tasks {
     }
   }
 
-  register("buildAgent") {
+  register("buildDependencies") {
     exec {
       commandLine("pnpm", "turbo", "build")
     }
   }
 
   prepareSandbox {
-    dependsOn("buildAgent")
+    dependsOn("buildDependencies")
+
+    // Copy the tabby-agent to the sandbox
     from(
       fileTree("node_modules/tabby-agent/dist/") {
         include("node/**/*")
@@ -82,6 +89,14 @@ tasks {
     ) {
       into("intellij-tabby/tabby-agent/")
     }
+
+    // Copy the tabby-chat-panel to the sandbox
+    from(
+      fileTree("node_modules/tabby-chat-panel/dist/") {
+        include("iife/tabby-chat-panel.min.js")
+      }
+    ) {
+      into("intellij-tabby/tabby-chat-panel/")
+    }
   }
 }
-

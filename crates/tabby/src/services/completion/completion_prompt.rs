@@ -134,12 +134,12 @@ fn build_prefix(language: &str, prefix: &str, snippets: &[Snippet]) -> String {
             if x.is_empty() {
                 comment_char.to_string()
             } else {
-                format!("{} {}", comment_char, x)
+                format!("{comment_char} {x}")
             }
         })
         .collect();
     let comments = commented_lines.join("\n");
-    format!("{}\n{}", comments, prefix)
+    format!("{comments}\n{prefix}")
 }
 
 fn extract_snippets_from_segments(
@@ -293,6 +293,7 @@ mod tests {
             relevant_snippets_from_changed_files: None,
             relevant_snippets_from_recently_opened_files: None,
             clipboard: None,
+            edit_history: None,
         }
     }
 
@@ -514,6 +515,7 @@ def this_is_prefix():\n";
             relevant_snippets_from_changed_files: None,
             relevant_snippets_from_recently_opened_files: None,
             clipboard: None,
+            edit_history: None,
         };
 
         let max_snippets_chars = 768;
@@ -540,6 +542,7 @@ def this_is_prefix():\n";
                 score: 1.0,
             }]),
             clipboard: None,
+            edit_history: None,
         };
 
         assert!(

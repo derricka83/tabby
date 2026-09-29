@@ -1,37 +1,17 @@
-import { createThread, type ThreadOptions } from "@quilted/threads";
-import type { ServerApi, ClientApi } from "tabby-chat-panel";
-import { Webview } from "vscode";
+import { window, ExtensionContext, ViewColumn } from "vscode";
+import { ChatWebview } from "./webview";
+import type { Client } from "../lsp/client";
+import type { GitProvider } from "../git/GitProvider";
 
-export function createThreadFromWebview<Self = Record<string, never>, Target = Record<string, never>>(
-  webview: Webview,
-  options?: ThreadOptions<Self, Target>,
-) {
-  return createThread(
-    {
-      send(message) {
-        webview.postMessage({ action: "postMessageToChatPanel", message });
-      },
-      listen(listener, { signal }) {
-        const { dispose } = webview.onDidReceiveMessage(listener);
-        signal?.addEventListener("abort", () => {
-          dispose();
-        });
-      },
-    },
-    options,
-  );
-}
+export async function createChatPanel(context: ExtensionContext, client: Client, gitProvider: GitProvider) {
+  const panel = window.createWebviewPanel(`tabby.chat.panel`, "Tabby", ViewColumn.One, {
+    retainContextWhenHidden: true,
+  });
 
-export function createClient(webview: Webview, api: ClientApi): ServerApi {
-  return createThreadFromWebview(webview, {
-    expose: {
-      navigate: api.navigate,
-      refresh: api.refresh,
-      onSubmitMessage: api.onSubmitMessage,
-      onApplyInEditor: api.onApplyInEditor,
-      onCopy: api.onCopy,
-      onLoaded: api.onLoaded,
-      onKeyboardEvent: api.onKeyboardEvent,
-    },
+  const chatWebview = new ChatWebview(context, client, gitProvider);
+  chatWebview.init(panel.webview);
+
+  panel.onDidDispose(() => {
+    chatWebview.dispose();
   });
 }

@@ -33,7 +33,7 @@ impl StopConditionFactory {
         }
     }
 
-    pub fn create(&self, text: &str, language: Option<&'static Language>) -> StopCondition {
+    pub fn create(&self, text: &str, language: Option<&'static Language>) -> StopCondition<'_> {
         if let Some(language) = language {
             StopCondition::new(self.get_trie(language), text)
         } else {
@@ -125,7 +125,7 @@ mod tests {
         assert!(!trie.common_prefix_search(&text).is_empty());
 
         let qwen25coder = reverse("qwen25 style stop words;<|file_sep|>");
-        assert!(!trie.common_prefix_search(&qwen25coder).is_empty());
+        assert!(!trie.common_prefix_search(qwen25coder).is_empty());
     }
 
     #[test]

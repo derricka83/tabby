@@ -93,7 +93,11 @@ impl GithubClient {
 
 #[async_trait]
 impl OAuthClient for GithubClient {
-    async fn exchange_code_for_token(&self, code: String) -> Result<String> {
+    async fn exchange_code_for_token(
+        &self,
+        code: String,
+        _state: Option<String>,
+    ) -> Result<String> {
         let credentials = self.read_credential().await?;
         let token_resp = self.exchange_access_token(code, credentials).await?;
         if !token_resp.error.is_empty() {
@@ -114,7 +118,7 @@ impl OAuthClient for GithubClient {
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", access_token),
+                format!("Bearer {access_token}"),
             )
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()
@@ -132,7 +136,7 @@ impl OAuthClient for GithubClient {
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
             .header(
                 reqwest::header::AUTHORIZATION,
-                format!("Bearer {}", access_token),
+                format!("Bearer {access_token}"),
             )
             .header("X-GitHub-Api-Version", "2022-11-28")
             .send()

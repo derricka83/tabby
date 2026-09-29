@@ -12,6 +12,7 @@ import * as z from 'zod'
 import { graphql } from '@/lib/gql/generates'
 import { LicenseType, OAuthProvider } from '@/lib/gql/generates/graphql'
 import { useMutation } from '@/lib/tabby/gql'
+import { oauthCredential } from '@/lib/tabby/query'
 import { cn } from '@/lib/utils'
 import {
   AlertDialog,
@@ -38,15 +39,17 @@ import {
   IconGitHub,
   IconGitLab,
   IconGoogle,
+  IconOidc,
   IconSpinner
 } from '@/components/ui/icons'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Separator } from '@/components/ui/separator'
 import { CopyButton } from '@/components/copy-button'
 import { LicenseGuard } from '@/components/license-guard'
 
-import { oauthCredential } from './oauth-credential-list'
+import { SubTitle } from './form-sub-title'
 
 export const updateOauthCredentialMutation = graphql(/* GraphQL */ `
   mutation updateOauthCredential($input: UpdateOAuthCredentialInput!) {
@@ -66,28 +69,43 @@ const oauthCallbackUrl = graphql(/* GraphQL */ `
   }
 `)
 
-const formSchema = z.object({
+const defaultFormSchema = z.object({
   clientId: z.string(),
-  clientSecret: z.string().optional(),
+  clientSecret: z.string(),
+  configUrl: z.string().optional(),
+  configScopes: z.string().optional(),
   provider: z.nativeEnum(OAuthProvider)
 })
 
-export type OAuthCredentialFormValues = z.infer<typeof formSchema>
+const updateFormSchema = defaultFormSchema.extend({
+  clientSecret: z.string().optional()
+})
+
+const providerExistedError =
+  'Provider already exists. Please choose another one'
+
+const oidcConfigUrlError = 'Config URL must be set for OpenID Connect'
+const oidcConfigScopesError = 'Config Scopes must be set for OpenID Connect'
 
 interface OAuthCredentialFormProps
   extends React.HTMLAttributes<HTMLDivElement> {
   isNew?: boolean
-  provider: OAuthProvider
-  defaultValues?: Partial<OAuthCredentialFormValues> | undefined
-  onSuccess?: (formValues: OAuthCredentialFormValues) => void
+  defaultProvider: OAuthProvider
+  defaultValues?: Partial<z.infer<typeof defaultFormSchema>> | undefined
+  onSuccess?: (formValues: z.infer<typeof defaultFormSchema>) => void
+  /**
+   * for creation, if there are existed providers, show a error message
+   */
+  existedProviders?: OAuthProvider[]
 }
 
 export default function OAuthCredentialForm({
   className,
   isNew,
-  provider,
+  defaultProvider,
   defaultValues,
   onSuccess,
+  existedProviders,
   ...props
 }: OAuthCredentialFormProps) {
   const router = useRouter()
@@ -95,14 +113,26 @@ export default function OAuthCredentialForm({
   const formatedDefaultValues = React.useMemo(() => {
     return {
       ...(defaultValues || {}),
-      provider
+      provider: defaultProvider || OAuthProvider.Github
     }
   }, [])
 
   const [deleteAlertVisible, setDeleteAlertVisible] = React.useState(false)
   const [isDeleting, setIsDeleting] = React.useState(false)
 
-  const form = useForm<OAuthCredentialFormValues>({
+  const formSchema = React.useMemo(() => {
+    if (!isNew) return updateFormSchema
+
+    return defaultFormSchema.extend({
+      provider: z
+        .nativeEnum(OAuthProvider)
+        .refine(v => !existedProviders?.includes(v), {
+          message: providerExistedError
+        })
+    })
+  }, [isNew, existedProviders])
+
+  const form = useForm<z.infer<typeof defaultFormSchema>>({
     resolver: zodResolver(formSchema),
     defaultValues: formatedDefaultValues
   })
@@ -124,19 +154,58 @@ export default function OAuthCredentialForm({
     form
   })
 
+  const provider = form.watch('provider')
+
+  React.useEffect(() => {
+    if (!isNew) {
+      return
+    }
+
+    if (provider && existedProviders?.includes(provider)) {
+      form.setError('provider', {
+        message: providerExistedError
+      })
+    } else {
+      form.clearErrors('provider')
+    }
+  }, [provider, isNew, existedProviders])
+
   const deleteOAuthCredential = useMutation(deleteOauthCredentialMutation)
 
-  const onSubmit = async (values: OAuthCredentialFormValues) => {
+  const onSubmit = async (values: z.infer<typeof defaultFormSchema>) => {
+    let validationError = false
+    if (provider === OAuthProvider.Oidc) {
+      if (!values.configUrl || values.configUrl === '') {
+        form.setError('configUrl', {
+          message: oidcConfigUrlError
+        })
+
+        validationError = true
+      }
+
+      if (!values.configScopes || values.configScopes === '') {
+        form.setError('configScopes', {
+          message: oidcConfigScopesError
+        })
+
+        validationError = true
+      }
+    }
+
     if (isNew) {
       const hasExistingProvider = await client
         .query(oauthCredential, { provider: values.provider })
         .then(res => !!res?.data?.oauthCredential)
       if (hasExistingProvider) {
         form.setError('provider', {
-          message: 'Provider already exists. Please choose another one'
+          message: providerExistedError
         })
-        return
+        validationError = true
       }
+    }
+
+    if (validationError) {
+      return
     }
 
     updateOauthCredential({ input: values })
@@ -171,19 +240,8 @@ export default function OAuthCredentialForm({
   return (
     <Form {...form}>
       <div className={cn('grid gap-2', className)} {...props}>
-        <form className="grid gap-6" onSubmit={form.handleSubmit(onSubmit)}>
-          <SubTitle className="mt-2">Basic information</SubTitle>
-          <FormItem>
-            <Label>Type</Label>
-            <RadioGroup defaultValue="oauth">
-              <div className="flex items-center space-x-2">
-                <RadioGroupItem value="oauth" id="type_oauth" />
-                <Label className="cursor-pointer" htmlFor="type_oauth">
-                  OAuth 2.0
-                </Label>
-              </div>
-            </RadioGroup>
-          </FormItem>
+        <form className="grid gap-4" onSubmit={form.handleSubmit(onSubmit)}>
+          <SubTitle>Basic information</SubTitle>
           <FormField
             control={form.control}
             name="provider"
@@ -197,46 +255,60 @@ export default function OAuthCredentialForm({
                     onValueChange={onChange}
                     {...rest}
                   >
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center">
                       <RadioGroupItem
                         value={OAuthProvider.Github}
                         id="r_github"
                         disabled={!isNew}
                       />
                       <Label
-                        className="flex cursor-pointer items-center gap-2"
+                        className="flex cursor-pointer items-center gap-2 pl-2"
                         htmlFor="r_github"
                       >
                         <IconGitHub className="h-5 w-5" />
                         GitHub
                       </Label>
                     </div>
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center">
                       <RadioGroupItem
                         value={OAuthProvider.Google}
                         id="r_google"
                         disabled={!isNew}
                       />
                       <Label
-                        className="flex cursor-pointer items-center gap-2"
+                        className="flex cursor-pointer items-center gap-2 pl-2"
                         htmlFor="r_google"
                       >
                         <IconGoogle className="h-5 w-5" />
                         Google
                       </Label>
                     </div>
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center">
                       <RadioGroupItem
                         value={OAuthProvider.Gitlab}
                         id="r_gitlab"
                         disabled={!isNew}
                       />
                       <Label
-                        className="flex cursor-pointer items-center gap-2"
+                        className="flex cursor-pointer items-center gap-2 pl-2"
                         htmlFor="r_gitlab"
                       >
                         <IconGitLab className="h-5 w-5" />
                         GitLab
+                      </Label>
+                    </div>
+                    <div className="flex items-center">
+                      <RadioGroupItem
+                        value={OAuthProvider.Oidc}
+                        id="r_oidc"
+                        disabled={!isNew}
+                      />
+                      <Label
+                        className="flex cursor-pointer items-center gap-2 pl-2"
+                        htmlFor="r_oidc"
+                      >
+                        <IconOidc className="h-5 w-5" />
+                        OpenID Connect Provider
                       </Label>
                     </div>
                   </RadioGroup>
@@ -248,17 +320,20 @@ export default function OAuthCredentialForm({
 
           {oauthRedirectUrlData && (
             <FormItem className="mt-4">
-              <div className="flex flex-col gap-2 rounded-lg border px-3 py-2">
+              <div className="flex flex-col gap-2 overflow-hidden rounded-lg border px-3 py-2">
                 <div className="text-sm text-muted-foreground">
                   Create your OAuth2 application with the following information
                 </div>
-                <div className="flex items-center justify-between">
+                <div className="flex flex-col justify-between sm:flex-row sm:items-center">
                   <div className="text-sm font-medium">
                     Authorization callback URL
                   </div>
                   <span className="flex items-center text-sm">
-                    {oauthRedirectUrlData.oauthCallbackUrl}
+                    <span className="truncate">
+                      {oauthRedirectUrlData.oauthCallbackUrl}
+                    </span>
                     <CopyButton
+                      className="shrink-0"
                       type="button"
                       value={oauthRedirectUrlData.oauthCallbackUrl!}
                     />
@@ -268,12 +343,58 @@ export default function OAuthCredentialForm({
             </FormItem>
           )}
 
-          <div>
+          <div className="mt-4">
             <SubTitle>OAuth provider information</SubTitle>
             <FormDescription>
               The information is provided by your identity provider.
             </FormDescription>
           </div>
+          {providerValue == OAuthProvider.Oidc && (
+            <FormField
+              control={form.control}
+              name="configUrl"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel required>Configuration URL</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="e.g. http://example.com/"
+                      autoCapitalize="none"
+                      autoComplete="off"
+                      autoCorrect="off"
+                      {...field}
+                    />
+                  </FormControl>
+                  <span className="text-xs">
+                    NOTE: The URL above should include the path but not include
+                    &quot;.well-known/openid-configuration&quot;
+                  </span>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
+          {providerValue == OAuthProvider.Oidc && (
+            <FormField
+              control={form.control}
+              name="configScopes"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel required>Configuration Scopes</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="e.g. openid profile email"
+                      autoCapitalize="none"
+                      autoComplete="off"
+                      autoCorrect="off"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          )}
           <FormField
             control={form.control}
             name="clientId"
@@ -317,13 +438,14 @@ export default function OAuthCredentialForm({
               </FormItem>
             )}
           />
+          <Separator className="my-2" />
           <div className="flex justify-end gap-4">
             <Button
               type="button"
               variant="ghost"
               onClick={navigateToSSOSettings}
             >
-              Cancel
+              Back
             </Button>
             {!isNew && (
               <AlertDialog
@@ -378,14 +500,5 @@ export default function OAuthCredentialForm({
         <FormMessage className="text-center" />
       </div>
     </Form>
-  )
-}
-
-function SubTitle({
-  className,
-  ...rest
-}: React.HTMLAttributes<HTMLDivElement>) {
-  return (
-    <div className={cn('mt-4 text-xl font-semibold', className)} {...rest} />
   )
 }

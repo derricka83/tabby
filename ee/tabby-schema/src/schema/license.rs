@@ -23,6 +23,11 @@ pub enum LicenseStatus {
     SeatsExceeded,
 }
 
+#[derive(GraphQLEnum, PartialEq, Debug, Clone, Deserialize)]
+pub enum LicenseFeature {
+    CustomLogo,
+}
+
 #[derive(GraphQLObject)]
 pub struct LicenseInfo {
     pub r#type: LicenseType,
@@ -31,6 +36,7 @@ pub struct LicenseInfo {
     pub seats_used: i32,
     pub issued_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
+    pub features: Option<Vec<LicenseFeature>>,
 }
 
 impl LicenseInfo {
@@ -39,7 +45,7 @@ impl LicenseInfo {
     }
 
     pub fn seat_limits_for_team_license() -> usize {
-        200
+        50
     }
 
     pub fn guard_seat_limit(mut self) -> Self {
@@ -80,6 +86,27 @@ impl LicenseInfo {
         }
 
         Ok(())
+    }
+
+    pub fn expire_in_days(&self) -> Option<i64> {
+        self.expires_at.map(|expires_at| {
+            let now = Utc::now();
+            let duration = expires_at.signed_duration_since(now);
+            duration.num_days()
+        })
+    }
+
+    pub fn ensure_available_features(&self, feature: LicenseFeature) -> Result<()> {
+        self.ensure_valid_license()?;
+        if let Some(features) = &self.features {
+            if features.contains(&feature) {
+                return Ok(());
+            }
+        }
+
+        Err(CoreError::InvalidLicense(
+            "Your plan doesn't include support for this feature.",
+        ))
     }
 }
 

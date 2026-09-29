@@ -12,9 +12,10 @@ use juniper::ID;
 use tabby_db::{DbConn, InvitationDAO};
 use tabby_schema::{
     auth::{
-        AuthenticationService, Invitation, JWTPayload, OAuthCredential, OAuthError, OAuthProvider,
-        OAuthResponse, RefreshTokenResponse, RegisterResponse, RequestInvitationInput,
-        TokenAuthResponse, UpdateOAuthCredentialInput, UserSecured,
+        AuthenticationService, Invitation, JWTPayload, LdapCredential, OAuthCredential, OAuthError,
+        OAuthProvider, OAuthResponse, RefreshTokenResponse, RegisterResponse,
+        RequestInvitationInput, TokenAuthResponse, UpdateLdapCredentialInput,
+        UpdateOAuthCredentialInput, UserSecured,
     },
     email::EmailService,
     is_demo_mode,
@@ -29,8 +30,12 @@ use super::{graphql_pagination_to_filter, UserSecuredExt};
 use crate::{
     bail,
     jwt::{generate_jwt, validate_jwt},
+    ldap::{self, LdapClient},
     oauth::{self, OAuthClient},
 };
+
+#[cfg(test)]
+pub mod testutils;
 
 #[derive(Clone)]
 struct ImpersonateUserCredential {
@@ -156,6 +161,11 @@ impl AuthenticationService for AuthenticationServiceImpl {
     }
 
     async fn generate_reset_password_url(&self, id: &ID) -> Result<String> {
+        let user = self.get_user(id).await?;
+        if user.is_sso_user {
+            bail!("Cannot generate reset password url for SSO users");
+        }
+
         let external_url = self.setting.read_network_setting().await?.external_url;
         let id = id.as_rowid()?;
         let user = self.db.get_user(id).await?.context("User doesn't exits")?;
@@ -163,7 +173,7 @@ impl AuthenticationService for AuthenticationServiceImpl {
             bail!("Inactive user's password cannot be reset");
         }
         let code = self.db.create_password_reset(id).await?;
-        let url = format!("{}/auth/reset-password?code={}", external_url, code);
+        let url = format!("{external_url}/auth/reset-password?code={code}");
         Ok(url)
     }
 
@@ -173,6 +183,10 @@ impl AuthenticationService for AuthenticationServiceImpl {
         let Some(user @ UserSecured { active: true, .. }) = user else {
             return Ok(None);
         };
+
+        if user.is_sso_user {
+            bail!("Cannot request password reset for SSO users");
+        }
 
         let id = user.id.as_rowid()?;
 
@@ -195,6 +209,11 @@ impl AuthenticationService for AuthenticationServiceImpl {
         let password_encrypted = password_hash(password).map_err(|_| anyhow!("Unknown error"))?;
 
         let user_id = self.db.verify_password_reset(code).await?;
+        let user = self.get_user(&user_id.as_id()).await?;
+        if user.is_sso_user {
+            bail!("Password cannot be reset for SSO users");
+        }
+
         let old_pass_encrypted = self
             .db
             .get_user(user_id)
@@ -220,6 +239,11 @@ impl AuthenticationService for AuthenticationServiceImpl {
     ) -> Result<()> {
         if is_demo_mode() {
             bail!("Changing passwords is disabled in demo mode");
+        }
+
+        let user = self.get_user(id).await?;
+        if user.is_sso_user {
+            bail!("Password cannot be changed for SSO users");
         }
 
         let user = self
@@ -275,6 +299,12 @@ impl AuthenticationService for AuthenticationServiceImpl {
         if is_demo_mode() {
             bail!("Changing profile data is disabled in demo mode");
         }
+
+        let user = self.get_user(id).await?;
+        if user.is_sso_user {
+            bail!("Name cannot be changed for SSO users");
+        }
+
         let id = id.as_rowid()?;
         self.db.update_user_name(id, name).await?;
         Ok(())
@@ -315,6 +345,44 @@ impl AuthenticationService for AuthenticationServiceImpl {
 
         let resp = TokenAuthResponse::new(access_token, refresh_token);
         Ok(resp)
+    }
+
+    async fn token_auth_ldap(&self, user_id: &str, password: &str) -> Result<TokenAuthResponse> {
+        let license = self
+            .license
+            .read()
+            .await
+            .context("Failed to read license info")?;
+
+        let credential = self.db.read_ldap_credential().await?;
+        if credential.is_none() {
+            bail!("LDAP is not configured");
+        }
+
+        let credential = credential.unwrap();
+        let mut client = ldap::new_ldap_client(
+            credential.host.as_ref(),
+            credential.port,
+            credential.encryption.as_str(),
+            credential.skip_tls_verify,
+            credential.bind_dn,
+            &credential.bind_password,
+            credential.base_dn,
+            credential.user_filter,
+            credential.email_attribute,
+            credential.name_attribute,
+        );
+
+        ldap_login(
+            &mut client,
+            &self.db,
+            &*self.setting,
+            &license,
+            &*self.mail,
+            user_id,
+            password,
+        )
+        .await
     }
 
     async fn refresh_token(&self, token: String) -> Result<RefreshTokenResponse> {
@@ -450,6 +518,7 @@ impl AuthenticationService for AuthenticationServiceImpl {
 
     async fn list_users(
         &self,
+        ids: Option<Vec<ID>>,
         after: Option<String>,
         before: Option<String>,
         first: Option<usize>,
@@ -457,9 +526,15 @@ impl AuthenticationService for AuthenticationServiceImpl {
     ) -> Result<Vec<UserSecured>> {
         let (skip_id, limit, backwards) = graphql_pagination_to_filter(after, before, first, last)?;
 
+        let rowids = ids.map(|ids| {
+            ids.into_iter()
+                .filter_map(|x| x.as_rowid().ok().map(|x| x as i32))
+                .collect()
+        });
+
         Ok(self
             .db
-            .list_users_with_filter(skip_id, limit, backwards)
+            .list_users_with_filter(rowids, skip_id, limit, backwards)
             .await?
             .into_iter()
             .map(|x| UserSecured::new(self.db.clone(), x))
@@ -486,6 +561,7 @@ impl AuthenticationService for AuthenticationServiceImpl {
     async fn oauth(
         &self,
         code: String,
+        state: Option<String>,
         provider: OAuthProvider,
     ) -> std::result::Result<OAuthResponse, OAuthError> {
         let client = oauth::new_oauth_client(provider, Arc::new(self.clone()));
@@ -498,6 +574,7 @@ impl AuthenticationService for AuthenticationServiceImpl {
         oauth_login(
             client,
             code,
+            state,
             &self.db,
             &*self.setting,
             &license,
@@ -526,6 +603,7 @@ impl AuthenticationService for AuthenticationServiceImpl {
             OAuthProvider::Github => external_url + "/oauth/callback/github",
             OAuthProvider::Google => external_url + "/oauth/callback/google",
             OAuthProvider::Gitlab => external_url + "/oauth/callback/gitlab",
+            OAuthProvider::Oidc => external_url + "/oauth/callback/oidc",
         };
         Ok(url)
     }
@@ -534,6 +612,8 @@ impl AuthenticationService for AuthenticationServiceImpl {
         self.db
             .update_oauth_credential(
                 input.provider.as_enum_str(),
+                input.config_url.as_deref(),
+                input.config_scopes.as_deref(),
                 &input.client_id,
                 input.client_secret.as_deref(),
             )
@@ -545,6 +625,82 @@ impl AuthenticationService for AuthenticationServiceImpl {
         self.db
             .delete_oauth_credential(provider.as_enum_str())
             .await?;
+        Ok(())
+    }
+
+    async fn read_ldap_credential(&self) -> Result<Option<LdapCredential>> {
+        let credential = self.db.read_ldap_credential().await?;
+        match credential {
+            Some(c) => Ok(Some(c.try_into()?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn test_ldap_connection(&self, input: UpdateLdapCredentialInput) -> Result<()> {
+        let password = if let Some(password) = input.bind_password.as_deref() {
+            password
+        } else {
+            &self
+                .db
+                .read_ldap_credential()
+                .await?
+                .ok_or_else(|| anyhow!("LDAP password is not configured"))?
+                .bind_password
+        };
+        let mut client = ldap::new_ldap_client(
+            input.host.as_ref(),
+            input.port as i64,
+            input.encryption.as_enum_str(),
+            input.skip_tls_verify,
+            input.bind_dn,
+            password,
+            input.base_dn,
+            input.user_filter,
+            input.email_attribute,
+            input.name_attribute,
+        );
+
+        if let Err(e) = client.validate("", "").await {
+            if e.to_string().contains("User not found") {
+                return Ok(());
+            } else {
+                bail!("Failed to connect to LDAP server: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn update_ldap_credential(&self, input: UpdateLdapCredentialInput) -> Result<()> {
+        let password = if let Some(password) = input.bind_password.as_deref() {
+            password
+        } else {
+            &self
+                .db
+                .read_ldap_credential()
+                .await?
+                .ok_or_else(|| anyhow!("LDAP password is not configured"))?
+                .bind_password
+        };
+        self.db
+            .update_ldap_credential(
+                &input.host,
+                input.port,
+                &input.bind_dn,
+                password,
+                &input.base_dn,
+                &input.user_filter,
+                input.encryption.as_enum_str(),
+                input.skip_tls_verify,
+                &input.email_attribute,
+                input.name_attribute.as_deref(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_ldap_credential(&self) -> Result<()> {
+        self.db.delete_ldap_credential().await?;
         Ok(())
     }
 
@@ -577,18 +733,41 @@ impl AuthenticationService for AuthenticationServiceImpl {
     }
 }
 
+async fn ldap_login(
+    client: &mut dyn LdapClient,
+    db: &DbConn,
+    setting: &dyn SettingService,
+    license: &LicenseInfo,
+    mail: &dyn EmailService,
+    user_id: &str,
+    password: &str,
+) -> Result<TokenAuthResponse> {
+    let user = client.validate(user_id, password).await?;
+    let user_id = get_or_create_sso_user(license, db, setting, mail, &user.email, &user.name)
+        .await
+        .map_err(|e| CoreError::Other(anyhow!("fail to get or create ldap user: {}", e)))?;
+
+    let refresh_token = db.create_refresh_token(user_id).await?;
+    let access_token = generate_jwt(user_id.as_id())
+        .map_err(|e| CoreError::Other(anyhow!("fail to create access_token: {}", e)))?;
+
+    let resp = TokenAuthResponse::new(access_token, refresh_token);
+    Ok(resp)
+}
+
 async fn oauth_login(
     client: Arc<dyn OAuthClient>,
     code: String,
+    state: Option<String>,
     db: &DbConn,
     setting: &dyn SettingService,
     license: &LicenseInfo,
     mail: &dyn EmailService,
 ) -> Result<OAuthResponse, OAuthError> {
-    let access_token = client.exchange_code_for_token(code).await?;
+    let access_token = client.exchange_code_for_token(code, state).await?;
     let email = client.fetch_user_email(&access_token).await?;
     let name = client.fetch_user_full_name(&access_token).await?;
-    let user_id = get_or_create_oauth_user(license, db, setting, mail, &email, &name).await?;
+    let user_id = get_or_create_sso_user(license, db, setting, mail, &email, &name).await?;
 
     let refresh_token = db.create_refresh_token(user_id).await?;
 
@@ -601,7 +780,7 @@ async fn oauth_login(
     Ok(resp)
 }
 
-async fn get_or_create_oauth_user(
+async fn get_or_create_sso_user(
     license: &LicenseInfo,
     db: &DbConn,
     setting: &dyn SettingService,
@@ -635,7 +814,7 @@ async fn get_or_create_oauth_user(
         // it's ok to set password to null here, because
         // 1. both `register` & `token_auth` mutation will do input validation, so empty password won't be accepted
         // 2. `password_verify` will always return false for empty password hash read from user table
-        // so user created here is only able to login by github oauth, normal login won't work
+        // so user created here is only able to login by github oauth, or ldap, normal login won't work
 
         let res = db.create_user(email.to_owned(), None, false, name).await?;
         if let Err(e) = mail.send_signup(email.to_string()).await {
@@ -701,6 +880,9 @@ fn password_verify(raw: &str, hash: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use tabby_schema::auth::LdapEncryptionKind;
+
+    use crate::service::auth::testutils::FakeLdapClient;
 
     struct MockLicenseService {
         status: LicenseStatus,
@@ -744,6 +926,7 @@ mod tests {
                 seats_used: self.seats_used,
                 issued_at: Some(Utc::now()),
                 expires_at: Some(Utc::now()),
+                features: Some(Vec::new()),
             })
         }
 
@@ -992,7 +1175,10 @@ mod tests {
             first,
             last,
             |after, before, first, last| async move {
-                Ok(db.list_users(after, before, first, last).await.unwrap())
+                Ok(db
+                    .list_users(None, after, before, first, last)
+                    .await
+                    .unwrap())
             },
         )
         .await
@@ -1004,7 +1190,7 @@ mod tests {
         let service = test_authentication_service().await;
         service
             .db
-            .update_security_setting(Some("example.com".into()), false)
+            .update_security_setting(Some("example.com".into()), false, false)
             .await
             .unwrap();
 
@@ -1036,7 +1222,7 @@ mod tests {
         service.db.update_user_active(id, false).await.unwrap();
         let setting = service.setting;
 
-        let res = get_or_create_oauth_user(
+        let res = get_or_create_sso_user(
             &license,
             &service.db,
             &*setting,
@@ -1049,11 +1235,11 @@ mod tests {
 
         service
             .db
-            .update_security_setting(Some("example.com".into()), false)
+            .update_security_setting(Some("example.com".into()), false, false)
             .await
             .unwrap();
 
-        let res = get_or_create_oauth_user(
+        let res = get_or_create_sso_user(
             &license,
             &service.db,
             &*setting,
@@ -1071,7 +1257,7 @@ mod tests {
         tokio::time::sleep(Duration::milliseconds(50).to_std().unwrap()).await;
         assert_eq!(mail.list_mail().await[0].subject, "Welcome to Tabby!");
 
-        let res = get_or_create_oauth_user(
+        let res = get_or_create_sso_user(
             &license,
             &service.db,
             &*setting,
@@ -1088,7 +1274,7 @@ mod tests {
             .await
             .unwrap();
 
-        let res = get_or_create_oauth_user(
+        let res = get_or_create_sso_user(
             &license,
             &service.db,
             &*setting,
@@ -1358,7 +1544,7 @@ mod tests {
 
         service
             .db
-            .update_security_setting(Some("abc.com".to_owned()), false)
+            .update_security_setting(Some("abc.com".to_owned()), false, false)
             .await
             .unwrap();
 
@@ -1458,19 +1644,24 @@ mod tests {
         let service = test_authentication_service().await;
         let id = service
             .db
-            .create_user("test@example.com".into(), None, true, None)
+            .create_user(
+                "test@example.com".into(),
+                password_hash("pass").ok(),
+                true,
+                None,
+            )
             .await
             .unwrap();
 
         let id = id.as_id();
 
         assert!(service
-            .update_user_password(&id, None, "newpass")
+            .update_user_password(&id, Some("pass"), "newpass")
             .await
             .is_ok());
 
         assert!(service
-            .update_user_password(&id, None, "newpass2")
+            .update_user_password(&id, Some("wrong"), "newpass2")
             .await
             .is_err());
 
@@ -1478,6 +1669,68 @@ mod tests {
             .update_user_password(&id, Some("newpass"), "newpass2")
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sso_user_forbid_update_password() {
+        let service = test_authentication_service().await;
+        let id = service
+            .db
+            .create_user("test@example.com".into(), None, true, None)
+            .await
+            .unwrap();
+
+        let id = id.as_id();
+
+        assert!(service
+            .update_user_password(&id, None, "newpass2")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sso_user_forbid_update_name() {
+        let service = test_authentication_service().await;
+        let id = service
+            .db
+            .create_user("test@example.com".into(), None, true, None)
+            .await
+            .unwrap();
+
+        assert!(service
+            .update_user_name(&id.as_id(), "newname".into())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sso_user_forbid_generate_password_reset_url() {
+        let service = test_authentication_service().await;
+        let id = service
+            .db
+            .create_user("test@example.com".into(), None, true, None)
+            .await
+            .unwrap();
+
+        assert!(service
+            .generate_reset_password_url(&id.as_id())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sso_user_forbid_request_password_reset_email() {
+        let service = test_authentication_service().await;
+        let _id = service
+            .db
+            .create_user("test@example.com".into(), None, true, None)
+            .await
+            .unwrap();
+
+        assert!(service
+            .request_password_reset_email("test@example.com".into())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1538,11 +1791,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ldap_credential() {
+        let service = test_authentication_service().await;
+        service
+            .update_ldap_credential(UpdateLdapCredentialInput {
+                host: "ldap.example.com".into(),
+                port: 389,
+                bind_dn: "cn=admin,dc=example,dc=com".into(),
+                bind_password: Some("password".into()),
+                base_dn: "dc=example,dc=com".into(),
+                user_filter: "(&(objectClass=person)(uid=%s))".into(),
+                encryption: LdapEncryptionKind::None,
+                skip_tls_verify: false,
+                email_attribute: "mail".into(),
+                name_attribute: Some("cn".into()),
+            })
+            .await
+            .unwrap();
+
+        // test the read_ldap_credential
+        let cred = service.read_ldap_credential().await.unwrap().unwrap();
+        assert_eq!(cred.host, "ldap.example.com");
+        assert_eq!(cred.port, 389);
+        assert_eq!(cred.bind_dn, "cn=admin,dc=example,dc=com");
+        assert_eq!(cred.base_dn, "dc=example,dc=com");
+        assert_eq!(cred.user_filter, "(&(objectClass=person)(uid=%s))");
+        assert_eq!(cred.encryption, LdapEncryptionKind::None);
+        assert!(!cred.skip_tls_verify);
+        assert_eq!(cred.email_attribute, "mail");
+        assert_eq!(cred.name_attribute, Some("cn".into()));
+
+        service
+            .update_ldap_credential(UpdateLdapCredentialInput {
+                host: "ldap1.example1.com".into(),
+                port: 3890,
+                bind_dn: "cn=admin1,dc=example1,dc=com".into(),
+                bind_password: None,
+                base_dn: "dc=example1,dc=com".into(),
+                user_filter: "((uid=%s))".into(),
+                encryption: LdapEncryptionKind::None,
+                skip_tls_verify: true,
+                email_attribute: "email".into(),
+                name_attribute: Some("name".into()),
+            })
+            .await
+            .unwrap();
+
+        // use db to verify the update and password sine it's not returned in service
+        let cred = service.db.read_ldap_credential().await.unwrap().unwrap();
+        assert_eq!(cred.host, "ldap1.example1.com");
+        assert_eq!(cred.port, 3890);
+        assert_eq!(cred.bind_dn, "cn=admin1,dc=example1,dc=com");
+        assert_eq!(cred.bind_password, "password");
+        assert_eq!(cred.base_dn, "dc=example1,dc=com");
+        assert_eq!(cred.user_filter, "((uid=%s))");
+        assert_eq!(cred.encryption, "none");
+        assert!(cred.skip_tls_verify);
+        assert_eq!(cred.email_attribute, "email");
+        assert_eq!(cred.name_attribute, Some("name".into()));
+    }
+
+    #[tokio::test]
     async fn test_oauth_credential() {
         let service = test_authentication_service().await;
         service
             .update_oauth_credential(UpdateOAuthCredentialInput {
                 provider: OAuthProvider::Google,
+                config_url: None,
+                config_scopes: None,
                 client_id: "id".into(),
                 client_secret: Some("secret".into()),
             })
@@ -1560,6 +1876,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_ldap_login() {
+        let service = test_authentication_service().await;
+        let license = LicenseInfo {
+            r#type: LicenseType::Enterprise,
+            status: LicenseStatus::Ok,
+            seats: 1000,
+            seats_used: 0,
+            issued_at: None,
+            expires_at: None,
+            features: None,
+        };
+
+        service
+            .create_invitation("user@example.com".into())
+            .await
+            .unwrap();
+        let mut ldap_client = FakeLdapClient { state: "" };
+
+        let response = ldap_login(
+            &mut ldap_client,
+            &service.db,
+            &*service.setting,
+            &license,
+            &*service.mail,
+            "user",
+            "password",
+        )
+        .await
+        .unwrap();
+
+        assert!(!response.refresh_token.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ldap_login_not_found() {
+        let service = test_authentication_service().await;
+        let license = LicenseInfo {
+            r#type: LicenseType::Enterprise,
+            status: LicenseStatus::Ok,
+            seats: 1000,
+            seats_used: 0,
+            issued_at: None,
+            expires_at: None,
+            features: None,
+        };
+
+        service
+            .create_invitation("user@example.com".into())
+            .await
+            .unwrap();
+        let mut ldap_client = FakeLdapClient { state: "not_found" };
+
+        let response = ldap_login(
+            &mut ldap_client,
+            &service.db,
+            &*service.setting,
+            &license,
+            &*service.mail,
+            "user",
+            "password",
+        )
+        .await;
+
+        assert!(response.is_err());
+    }
+
+    #[tokio::test]
     async fn test_oauth_login() {
         let service = test_authentication_service().await;
         let license = LicenseInfo {
@@ -1569,6 +1952,7 @@ mod tests {
             seats_used: 0,
             issued_at: None,
             expires_at: None,
+            features: None,
         };
 
         let client = Arc::new(TestOAuthClient {
@@ -1585,6 +1969,7 @@ mod tests {
         let response = oauth_login(
             client,
             "fakecode".into(),
+            None,
             &service.db,
             &*service.setting,
             &license,
@@ -1604,6 +1989,7 @@ mod tests {
         let response = oauth_login(
             client,
             "fakecode".into(),
+            None,
             &service.db,
             &*service.setting,
             &license,

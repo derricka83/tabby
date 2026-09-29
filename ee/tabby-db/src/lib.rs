@@ -1,22 +1,32 @@
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use anyhow::anyhow;
+pub use attachment::{
+    Attachment, AttachmentClientCode, AttachmentCode, AttachmentCodeFileList, AttachmentCommitDoc,
+    AttachmentDoc, AttachmentIngestedDoc, AttachmentIssueDoc, AttachmentPageDoc, AttachmentPullDoc,
+    AttachmentWebDoc,
+};
 use cache::Cache;
 use cached::TimedSizedCache;
 use chrono::{DateTime, Utc};
 pub use email_setting::EmailSettingDAO;
+pub use ingestion::{IngestedDocumentDAO, IngestedDocumentStatusDAO, IngestionStatusDAO};
 pub use integrations::IntegrationDAO;
 pub use invitations::InvitationDAO;
 pub use job_runs::JobRunDAO;
+pub use ldap_credential::LdapCredentialDAO;
+pub use notifications::NotificationDAO;
 pub use oauth_credential::OAuthCredentialDAO;
+pub use pages::{PageDAO, PageSectionDAO};
 pub use provided_repositories::ProvidedRepositoryDAO;
 pub use repositories::RepositoryDAO;
 pub use server_setting::ServerSettingDAO;
-use sqlx::{query, query_scalar, sqlite::SqliteQueryResult, Pool, Sqlite, SqlitePool};
-pub use threads::{
-    ThreadDAO, ThreadMessageAttachmentClientCode, ThreadMessageAttachmentCode,
-    ThreadMessageAttachmentDoc, ThreadMessageDAO,
+use sqlx::{
+    query, query_scalar,
+    sqlite::{SqlitePoolOptions, SqliteQueryResult},
+    Pool, Sqlite, SqlitePool,
 };
+pub use threads::{ThreadDAO, ThreadMessageDAO};
 use tokio::sync::Mutex;
 use user_completions::UserCompletionDailyStatsDAO;
 pub use user_events::UserEventDAO;
@@ -25,20 +35,26 @@ pub use users::UserDAO;
 pub use web_documents::WebDocumentDAO;
 
 mod access_policy;
+mod attachment;
 pub mod cache;
 mod email_setting;
+mod ingestion;
 mod integrations;
 mod invitations;
 mod job_runs;
+mod ldap_credential;
 #[cfg(test)]
 mod migration_tests;
+mod notifications;
 mod oauth_credential;
+mod pages;
 mod password_reset;
 mod provided_repositories;
 mod refresh_tokens;
 mod repositories;
 mod server_setting;
 mod threads;
+mod user_chats;
 mod user_completions;
 mod user_events;
 mod user_groups;
@@ -148,12 +164,24 @@ impl DbConn {
 
     pub async fn new(db_file: &Path) -> Result<Self> {
         tokio::fs::create_dir_all(db_file.parent().unwrap()).await?;
-        Self::backup_db(db_file).await?;
 
         let options = SqliteConnectOptions::new()
+            // Reduce SQLITE_BUSY (code 5) errors. Note that the error message "database is locked" should not be confused with SQLITE_LOCKED.
+            // For more details, see:
+            // 1. https://til.simonwillison.net/sqlite/enabling-wal-mode
+            // 2. https://www.sqlite.org/wal.html
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .filename(db_file)
             .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(64)
+            .min_connections(2)
+            .acquire_timeout(Duration::from_secs(6))
+            .idle_timeout(Duration::from_secs(300))
+            .max_lifetime(Duration::from_secs(3600))
+            .connect_with(options)
+            .await?;
+        Self::backup_db(db_file, &pool).await?;
         Self::init_db(pool).await
     }
 
@@ -161,7 +189,19 @@ impl DbConn {
     /// backup format:
     /// for prod - db.backup-${date}.sqlite
     /// for non-prod - dev-db.backup-${date}.sqlite
-    async fn backup_db(db_file: &Path) -> Result<()> {
+    async fn backup_db(db_file: &Path, pool: &SqlitePool) -> Result<()> {
+        use sqlx_migrate_validate::Validate;
+
+        let mut conn = pool.acquire().await?;
+        if sqlx::migrate!("./migrations")
+            .validate(&mut *conn)
+            .await
+            .is_ok()
+        {
+            // No migration is needed, skip the backup.
+            return Ok(());
+        }
+
         if !tokio::fs::try_exists(db_file).await? {
             return Ok(());
         }
@@ -175,7 +215,7 @@ impl DbConn {
 
         let today = Utc::now().date_naive().format("%Y%m%d").to_string();
         let backup_file = db_file.with_file_name(
-            db_file_name.replace(".sqlite", format!(".backup-{}.sqlite", today).as_str()),
+            db_file_name.replace(".sqlite", format!(".backup-{today}.sqlite").as_str()),
         );
 
         tokio::fs::copy(db_file, &backup_file).await?;

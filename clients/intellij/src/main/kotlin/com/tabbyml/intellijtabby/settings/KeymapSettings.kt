@@ -74,22 +74,30 @@ class KeymapSettings(private val project: Project) {
 
   companion object {
     private val DEFAULT_KEYMAP_SCHEMA = mapOf(
-      "Tabby.TriggerInlineCompletion" to listOf(
+      "Tabby.InlineCompletion.Trigger" to listOf(
         KeyboardShortcut.fromString("ctrl BACK_SLASH"), KeyboardShortcut.fromString("alt BACK_SLASH")
       ),
       "Tabby.InlineCompletion.TabAccept" to listOf(KeyboardShortcut.fromString("TAB")),
       "Tabby.InlineCompletion.AcceptNextLine" to listOf(KeyboardShortcut.fromString("ctrl TAB")),
       "Tabby.InlineCompletion.AcceptNextWord" to listOf(KeyboardShortcut.fromString("ctrl RIGHT")),
       "Tabby.InlineCompletion.Dismiss" to listOf(KeyboardShortcut.fromString("ESCAPE")),
+      "Tabby.Chat.ToggleChatToolWindow" to listOf(KeyboardShortcut.fromString("ctrl L")),
+      "Tabby.InlineChat.Open" to listOf(KeyboardShortcut.fromString("ctrl I")),
+      "Tabby.InlineChat.Resolve.Accept" to listOf(KeyboardShortcut.fromString("ctrl shift D")),
+      "Tabby.InlineChat.Resolve.Discard" to listOf(KeyboardShortcut.fromString("ctrl ESCAPE")),
     )
     private val TABBY_STYLE_KEYMAP_SCHEMA = mapOf(
-      "Tabby.TriggerInlineCompletion" to listOf(
+      "Tabby.InlineCompletion.Trigger" to listOf(
         KeyboardShortcut.fromString("ctrl BACK_SLASH"), KeyboardShortcut.fromString("alt BACK_SLASH")
       ),
       "Tabby.InlineCompletion.TabAccept" to listOf(KeyboardShortcut.fromString("ctrl TAB")),
       "Tabby.InlineCompletion.AcceptNextLine" to listOf(KeyboardShortcut.fromString("TAB")),
       "Tabby.InlineCompletion.AcceptNextWord" to listOf(KeyboardShortcut.fromString("ctrl RIGHT")),
       "Tabby.InlineCompletion.Dismiss" to listOf(KeyboardShortcut.fromString("ESCAPE")),
+      "Tabby.Chat.ToggleChatToolWindow" to listOf(KeyboardShortcut.fromString("ctrl L")),
+      "Tabby.InlineChat.Open" to listOf(KeyboardShortcut.fromString("ctrl I")),
+      "Tabby.InlineChat.Resolve.Accept" to listOf(KeyboardShortcut.fromString("ctrl shift D")),
+      "Tabby.InlineChat.Resolve.Discard" to listOf(KeyboardShortcut.fromString("ctrl ESCAPE")),
     )
   }
 }

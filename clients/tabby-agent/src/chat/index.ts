@@ -1,43 +1,57 @@
-import type { Connection } from "vscode-languageserver";
+import { EventEmitter } from "events";
+import type { Connection, Disposable } from "vscode-languageserver";
 import type { ServerCapabilities } from "../protocol";
 import type { Feature } from "../feature";
 import type { TabbyApiClient } from "../http/tabbyApiClient";
-import { RegistrationRequest, UnregistrationRequest } from "vscode-languageserver";
-import { ChatFeatureRegistration } from "../protocol";
+import { ChatFeatures } from "../protocol";
 
-export class ChatFeature implements Feature {
-  constructor(private readonly tabbyApiClient: TabbyApiClient) {}
+export class ChatFeature extends EventEmitter implements Feature {
+  private isApiAvailable = false;
+  private featureRegistration: Disposable | undefined = undefined;
 
-  initialize(): ServerCapabilities {
+  constructor(readonly tabbyApiClient: TabbyApiClient) {
+    super();
+  }
+
+  isAvailable(): boolean {
+    return this.isApiAvailable;
+  }
+
+  private updateIsAvailable() {
+    const health = this.tabbyApiClient.getServerHealth();
+    const isAvailable = !!(health && health["chat_model"]);
+    if (this.isApiAvailable != isAvailable) {
+      this.isApiAvailable = isAvailable;
+      this.emit("isAvailableUpdated", isAvailable);
+    }
+  }
+
+  initialize(connection: Connection): ServerCapabilities {
+    this.updateIsAvailable();
+    this.tabbyApiClient.on("statusUpdated", async () => {
+      this.updateIsAvailable();
+      await this.syncFeatureRegistration(connection);
+    });
+
     return {};
   }
 
   async initialized(connection: Connection) {
     await this.syncFeatureRegistration(connection);
-    this.tabbyApiClient.on("statusUpdated", async () => {
-      await this.syncFeatureRegistration(connection);
-    });
   }
 
   private async syncFeatureRegistration(connection: Connection) {
-    if (this.tabbyApiClient.isChatApiAvailable()) {
-      connection.sendRequest(RegistrationRequest.type, {
-        registrations: [
-          {
-            id: ChatFeatureRegistration.type.method,
-            method: ChatFeatureRegistration.type.method,
-          },
-        ],
-      });
+    if (this.isApiAvailable) {
+      if (!this.featureRegistration) {
+        try {
+          this.featureRegistration = await connection.client.register(ChatFeatures.type);
+        } catch (error) {
+          // client may not support feature registration, ignore this error
+        }
+      }
     } else {
-      connection.sendRequest(UnregistrationRequest.type, {
-        unregisterations: [
-          {
-            id: ChatFeatureRegistration.type.method,
-            method: ChatFeatureRegistration.type.method,
-          },
-        ],
-      });
+      this.featureRegistration?.dispose();
+      this.featureRegistration = undefined;
     }
   }
 }

@@ -1,7 +1,9 @@
 mod completion_prompt;
+mod next_edit_prompt;
 
 use std::sync::Arc;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tabby_common::{
     api::{
@@ -15,6 +17,7 @@ use tabby_common::{
 };
 use tabby_inference::{
     ChatCompletionStream, CodeGeneration, CodeGenerationOptions, CodeGenerationOptionsBuilder,
+    CompletionStream,
 };
 use thiserror::Error;
 use utoipa::ToSchema;
@@ -55,6 +58,27 @@ pub struct CompletionRequest {
 
     /// The seed used for randomly selecting tokens
     seed: Option<u64>,
+
+    /// The mode for completion. Use 'standard' for normal code completions or 'next_edit_suggestion'
+    /// to predict the next edit the user will make.
+    #[serde(default = "default_standard_mode")]
+    mode: String,
+}
+
+pub fn default_standard_mode() -> String {
+    "standard".to_string()
+}
+
+/// Contains information about edit history for next edit suggestion mode
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug)]
+pub struct EditHistory {
+    original_code: String,
+
+    /// Unified git-style diff of all edits made to the file
+    edits_diff: String,
+
+    /// Current version of the code after all edits
+    current_version: String,
 }
 
 impl CompletionRequest {
@@ -75,6 +99,11 @@ impl CompletionRequest {
         self.debug_options
             .as_ref()
             .is_some_and(|x| x.disable_retrieval_augmented_code_completion)
+    }
+
+    /// Returns true if the request is for next edit suggestion mode.
+    fn is_next_edit_suggestion_mode(&self) -> bool {
+        self.mode == "next_edit_suggestion"
     }
 }
 
@@ -148,6 +177,9 @@ pub struct Segments {
 
     /// Clipboard content when requesting code completion.
     clipboard: Option<String>,
+
+    /// Required when mode is 'next_edit_suggestion'. Contains information about edit history.
+    edit_history: Option<EditHistory>,
 }
 
 impl From<Segments> for api::event::Segments {
@@ -218,14 +250,23 @@ pub struct CompletionResponse {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     debug_data: Option<DebugData>,
+
+    #[serde(default = "default_standard_mode")]
+    mode: String,
 }
 
 impl CompletionResponse {
-    pub fn new(id: String, choices: Vec<Choice>, debug_data: Option<DebugData>) -> Self {
+    pub fn new(
+        id: String,
+        choices: Vec<Choice>,
+        debug_data: Option<DebugData>,
+        mode: String,
+    ) -> Self {
         Self {
             id,
             choices,
             debug_data,
+            mode,
         }
     }
 }
@@ -239,18 +280,22 @@ pub struct DebugData {
     prompt: Option<String>,
 }
 
+/// CompletionService enhances the CodeGeneration feature by adding Retrieval Augmented Code Completion capability.
+/// It enables the retrieval of pertinent code snippets from the code repository,
+/// which are then utilized as prompts for the code generation model.
 pub struct CompletionService {
     config: CompletionConfig,
     engine: Arc<CodeGeneration>,
     logger: Arc<dyn EventLogger>,
     prompt_builder: completion_prompt::PromptBuilder,
+    next_edit_prompt_builder: next_edit_prompt::NextEditPromptBuilder,
 }
 
 impl CompletionService {
     fn new(
         config: CompletionConfig,
         engine: Arc<CodeGeneration>,
-        code: Arc<dyn CodeSearch>,
+        code: Option<Arc<dyn CodeSearch>>,
         logger: Arc<dyn EventLogger>,
         prompt_template: Option<String>,
     ) -> Self {
@@ -259,8 +304,9 @@ impl CompletionService {
             prompt_builder: completion_prompt::PromptBuilder::new(
                 &config.code_search_params,
                 prompt_template,
-                Some(code),
+                code,
             ),
+            next_edit_prompt_builder: next_edit_prompt::NextEditPromptBuilder::new(),
             config,
             logger,
         }
@@ -288,6 +334,7 @@ impl CompletionService {
         seed: Option<u64>,
         max_input_length: usize,
         max_output_tokens: usize,
+        mode: String,
     ) -> CodeGenerationOptions {
         let mut builder = CodeGenerationOptionsBuilder::default();
         builder
@@ -300,6 +347,9 @@ impl CompletionService {
         seed.inspect(|x| {
             builder.seed(*x);
         });
+
+        builder.mode(mode);
+
         builder
             .build()
             .expect("Failed to create text generation options")
@@ -313,17 +363,30 @@ impl CompletionService {
     ) -> Result<CompletionResponse, CompletionError> {
         let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4());
         let language = request.language_or_unknown();
+
+        if request.is_next_edit_suggestion_mode() {
+            return self
+                .generate_next_edit_suggestion(request, completion_id, language, user_agent)
+                .await;
+        }
+
         let options = Self::text_generation_options(
             language.as_str(),
             request.temperature,
             request.seed,
             self.config.max_input_length,
             self.config.max_decoding_tokens,
+            request.mode.clone(),
         );
 
+        let mut use_crlf = false;
         let (prompt, segments, snippets) = if let Some(prompt) = request.raw_prompt() {
             (prompt, None, vec![])
         } else if let Some(segments) = request.segments.as_ref() {
+            if contains_crlf(segments) {
+                use_crlf = true;
+            }
+
             let snippets = self
                 .build_snippets(
                     &language,
@@ -335,13 +398,14 @@ impl CompletionService {
             let prompt = self
                 .prompt_builder
                 .build(&language, segments.clone(), &snippets);
-            (prompt, Some(segments), snippets)
+
+            (override_prompt(prompt, use_crlf), Some(segments), snippets)
         } else {
             return Err(CompletionError::EmptyPrompt);
         };
 
-        let text = self.engine.generate(&prompt, options).await;
-        let segments = segments.cloned().map(|s| s.into());
+        let generated_text =
+            override_generated_text(self.engine.generate(&prompt, options).await, use_crlf);
 
         self.logger.log(
             request.user.clone(),
@@ -349,10 +413,10 @@ impl CompletionService {
                 completion_id: completion_id.clone(),
                 language,
                 prompt: prompt.clone(),
-                segments,
+                segments: segments.cloned().map(|x| x.into()),
                 choices: vec![api::event::Choice {
                     index: 0,
-                    text: text.clone(),
+                    text: generated_text.clone(),
                 }],
                 user_agent: user_agent.map(|x| x.to_owned()),
             },
@@ -368,26 +432,124 @@ impl CompletionService {
 
         Ok(CompletionResponse::new(
             completion_id,
-            vec![Choice::new(text)],
+            vec![Choice::new(generated_text)],
             debug_data,
+            "standard".to_string(),
         ))
+    }
+
+    async fn generate_next_edit_suggestion(
+        &self,
+        request: &CompletionRequest,
+        completion_id: String,
+        language: String,
+        user_agent: Option<&str>,
+    ) -> Result<CompletionResponse, CompletionError> {
+        let segments = request
+            .segments
+            .as_ref()
+            .ok_or(CompletionError::EmptyPrompt)?;
+
+        let edit_history = segments
+            .edit_history
+            .as_ref()
+            .ok_or(CompletionError::EmptyPrompt)?;
+
+        let prompt = self.next_edit_prompt_builder.build_prompt(edit_history);
+
+        let options = Self::text_generation_options(
+            language.as_str(),
+            request.temperature,
+            request.seed,
+            self.config.max_input_length,
+            self.config.max_decoding_tokens * 2,
+            request.mode.clone(),
+        );
+
+        let generated_text = self.engine.generate(&prompt, options).await;
+
+        self.logger.log(
+            request.user.clone(),
+            Event::Completion {
+                completion_id: completion_id.clone(),
+                language,
+                prompt: prompt.clone(),
+                segments: None,
+                choices: vec![api::event::Choice {
+                    index: 0,
+                    text: generated_text.clone(),
+                }],
+                user_agent: user_agent.map(|x| x.to_owned()),
+            },
+        );
+
+        let debug_data = request
+            .debug_options
+            .as_ref()
+            .map(|debug_options| DebugData {
+                snippets: None,
+                prompt: debug_options.return_prompt.then_some(prompt),
+            });
+
+        Ok(CompletionResponse::new(
+            completion_id,
+            vec![Choice::new(generated_text)],
+            debug_data,
+            "next_edit_suggestion".to_string(),
+        ))
+    }
+}
+
+fn contains_crlf(segments: &Segments) -> bool {
+    if segments.prefix.contains("\r\n") {
+        return true;
+    }
+    if let Some(suffix) = &segments.suffix {
+        if suffix.contains("\r\n") {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn override_prompt(prompt: String, use_crlf: bool) -> String {
+    if use_crlf {
+        prompt.replace("\r\n", "\n")
+    } else {
+        prompt
+    }
+}
+
+/// override_generated_text replaces \n with \r\n in the generated text if use_crlf is true.
+/// This is used to ensure that the generated text has the same line endings as the prompt.
+///
+/// Because there might be \r\n in the text, which also has a `\n` and should not be replaced,
+/// we can not simply replace \n with \r\n.
+fn override_generated_text(generated: String, use_crlf: bool) -> String {
+    if use_crlf {
+        let re = Regex::new(r"([^\r])\n").unwrap(); // Match \n that is preceded by anything except \r
+        re.replace_all(&generated, "$1\r\n").to_string() // Replace with captured character and \r\n
+    } else {
+        generated
     }
 }
 
 pub async fn create_completion_service_and_chat(
     config: &CompletionConfig,
-    code: Arc<dyn CodeSearch>,
+    code: Option<Arc<dyn CodeSearch>>,
     logger: Arc<dyn EventLogger>,
     completion: Option<ModelConfig>,
     chat: Option<ModelConfig>,
 ) -> (
     Option<CompletionService>,
+    Option<Arc<dyn CompletionStream>>,
     Option<Arc<dyn ChatCompletionStream>>,
 ) {
-    let (code_generation, prompt, chat) =
+    let (code_generation, completion_stream, chat, prompt) =
         model::load_code_generation_and_chat(completion, chat).await;
 
-    let completion = code_generation.map(|code_generation| {
+    let completion = code_generation.clone().map(|code_generation| {
         CompletionService::new(
             config.to_owned(),
             code_generation.clone(),
@@ -399,7 +561,7 @@ pub async fn create_completion_service_and_chat(
         )
     });
 
-    (completion, chat)
+    (completion, completion_stream, chat)
 }
 
 #[cfg(test)]
@@ -450,7 +612,7 @@ mod tests {
         CompletionService::new(
             CompletionConfig::default(),
             Arc::new(generation),
-            Arc::new(MockCodeSearch),
+            Some(Arc::new(MockCodeSearch)),
             Arc::new(MockEventLogger),
             Some("<pre>{prefix}<mid>{suffix}<end>".into()),
         )
@@ -468,6 +630,7 @@ mod tests {
             relevant_snippets_from_changed_files: None,
             relevant_snippets_from_recently_opened_files: None,
             clipboard: None,
+            edit_history: None,
         };
         let request = CompletionRequest {
             language: Some("rust".into()),
@@ -476,6 +639,7 @@ mod tests {
             debug_options: None,
             temperature: None,
             seed: None,
+            mode: "standard".into(),
         };
 
         let allowed_code_repository = AllowedCodeRepository::default();
@@ -489,5 +653,101 @@ mod tests {
             .prompt_builder
             .build("rust", segment.clone(), &[]);
         assert_eq!(prompt, "<pre>fn hello_world() -> &'static str {<mid>}<end>");
+    }
+
+    #[test]
+    fn test_contains_crlf() {
+        let contained_crlf = vec![
+            Segments {
+                prefix: "fn hello_world() -> &'static str {\r\n".into(),
+                suffix: Some("}".into()),
+                filepath: None,
+                git_url: None,
+                declarations: None,
+                relevant_snippets_from_changed_files: None,
+                relevant_snippets_from_recently_opened_files: None,
+                clipboard: None,
+                edit_history: None,
+            },
+            Segments {
+                prefix: "fn hello_world() -> &'static str {".into(),
+                suffix: Some("}\r\n".into()),
+                filepath: None,
+                git_url: None,
+                declarations: None,
+                relevant_snippets_from_changed_files: None,
+                relevant_snippets_from_recently_opened_files: None,
+                clipboard: None,
+                edit_history: None,
+            },
+            Segments {
+                prefix: "fn hello_world() -> &'static str {\r\n".into(),
+                suffix: Some("}\r\n".into()),
+                filepath: None,
+                git_url: None,
+                declarations: None,
+                relevant_snippets_from_changed_files: None,
+                relevant_snippets_from_recently_opened_files: None,
+                clipboard: None,
+                edit_history: None,
+            },
+        ];
+        for segments in contained_crlf {
+            assert!(contains_crlf(&segments));
+        }
+
+        let not_contained_crlf = vec![Segments {
+            prefix: "fn hello_world() -> &'static str {\r".into(),
+            suffix: Some("}\n".into()),
+            filepath: None,
+            git_url: None,
+            declarations: None,
+            relevant_snippets_from_changed_files: None,
+            relevant_snippets_from_recently_opened_files: None,
+            clipboard: None,
+            edit_history: None,
+        }];
+        for segments in not_contained_crlf {
+            assert!(!contains_crlf(&segments));
+        }
+    }
+
+    #[test]
+    fn test_override_prompt() {
+        let prompt = "fn hello_world() -> &'static str {\r\n".to_string();
+        let use_crlf = true;
+        assert_eq!(
+            override_prompt(prompt.clone(), use_crlf),
+            "fn hello_world() -> &'static str {\n"
+        );
+
+        let use_crlf = false;
+        assert_eq!(override_prompt(prompt.clone(), use_crlf), prompt);
+    }
+
+    #[test]
+    fn test_override_generated() {
+        let cases = vec![
+            (
+                "fn hello_world() -> &'static str {\r\n".to_string(),
+                "fn hello_world() -> &'static str {\r\n".to_string(),
+            ),
+            (
+                "fn hello_world() -> &'static str {\n".to_string(),
+                "fn hello_world() -> &'static str {\r\n".to_string(),
+            ),
+            (
+                "fn hello_world() -> &'static str {\r".to_string(),
+                "fn hello_world() -> &'static str {\r".to_string(),
+            ),
+            (
+                "fn hello_world() -> &'static str {".to_string(),
+                "fn hello_world() -> &'static str {".to_string(),
+            ),
+        ];
+
+        for (generated, expected) in cases {
+            assert_eq!(override_generated_text(generated, true), expected);
+        }
     }
 }

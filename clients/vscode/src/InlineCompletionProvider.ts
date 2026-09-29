@@ -14,7 +14,7 @@ import { InlineCompletionParams } from "vscode-languageclient";
 import { InlineCompletionRequest, InlineCompletionList, EventParams } from "tabby-agent";
 import { EventEmitter } from "events";
 import { getLogger } from "./logger";
-import { Client } from "./lsp/Client";
+import { Client } from "./lsp/client";
 import { Config } from "./Config";
 
 interface DisplayedCompletion {
@@ -63,6 +63,13 @@ export class InlineCompletionProvider extends EventEmitter implements InlineComp
       return null;
     }
 
+    // Skip if the current language is disabled
+    const currentLanguage = document.languageId;
+    if (this.config.disabledLanguages.includes(currentLanguage)) {
+      this.logger.debug(`Skipping completion for disabled language: ${currentLanguage}`);
+      return null;
+    }
+
     // Skip when trigger automatically and text selected
     if (
       context.triggerKind === InlineCompletionTriggerKind.Automatic &&
@@ -70,12 +77,6 @@ export class InlineCompletionProvider extends EventEmitter implements InlineComp
       !window.activeTextEditor.selection.isEmpty
     ) {
       this.logger.debug("Text selected, skipping.");
-      return null;
-    }
-
-    // Check if autocomplete widget is visible
-    if (context.selectedCompletionInfo !== undefined) {
-      this.logger.debug("Autocomplete widget is visible, skipping.");
       return null;
     }
 
@@ -96,6 +97,7 @@ export class InlineCompletionProvider extends EventEmitter implements InlineComp
     };
     let request: Promise<InlineCompletionList | null> | undefined = undefined;
     try {
+      this.client.fileTrack.addingChangeEditor(window.activeTextEditor);
       request = this.client.languageClient.sendRequest(InlineCompletionRequest.method, params, token);
       this.ongoing = request;
       this.emit("didChangeLoading", true);
@@ -209,5 +211,28 @@ export class InlineCompletionProvider extends EventEmitter implements InlineComp
     };
     // await not required
     this.client.telemetry.postEvent(params);
+  }
+
+  /**
+   * Calculate the edited range in the modified document as if the current completion item has been accepted.
+   * @return {Range | undefined} - The range with the current completion item
+   */
+  public calcEditedRangeAfterAccept(): Range | undefined {
+    const item = this.displayedCompletion?.completions.items[this.displayedCompletion.index];
+    const range = item?.range;
+    if (!range) {
+      // FIXME: If the item has a null range, we can use current position and text length to calculate the result range
+      return undefined;
+    }
+    if (!item) {
+      return undefined;
+    }
+    const length = (item.insertText as string).split("\n").length - 1; //remove current line count;
+    const completionRange = new Range(
+      new Position(range.start.line, range.start.character),
+      new Position(range.end.line + length + 1, 0),
+    );
+    this.logger.debug("Calculate edited range for displayed completion item:", completionRange);
+    return completionRange;
   }
 }

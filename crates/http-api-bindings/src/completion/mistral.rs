@@ -5,7 +5,7 @@ use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use tabby_inference::{CompletionOptions, CompletionStream};
 
-use super::FIM_TOKEN;
+use super::split_fim_prompt;
 
 pub struct MistralFIMEngine {
     client: reqwest::Client,
@@ -21,12 +21,12 @@ impl MistralFIMEngine {
         api_endpoint: Option<&str>,
         api_key: Option<String>,
         model_name: Option<String>,
-    ) -> Self {
+    ) -> Box<dyn CompletionStream> {
         let client = reqwest::Client::new();
         let model_name = model_name.unwrap_or("codestral-latest".into());
         let api_key = api_key.expect("API key is required for mistral/completion");
 
-        Self {
+        Box::new(Self {
             client,
             model_name,
             api_endpoint: format!(
@@ -34,7 +34,7 @@ impl MistralFIMEngine {
                 api_endpoint.unwrap_or(DEFAULT_API_ENDPOINT)
             ),
             api_key,
-        }
+        })
     }
 }
 
@@ -67,14 +67,15 @@ struct FIMResponseDelta {
 
 #[async_trait]
 impl CompletionStream for MistralFIMEngine {
-    async fn generate(&self, prompt: &str, options: CompletionOptions) -> BoxStream<String> {
-        let parts = prompt.splitn(2, FIM_TOKEN).collect::<Vec<_>>();
+    async fn generate(
+        &self,
+        prompt: &str,
+        options: CompletionOptions,
+    ) -> BoxStream<'life0, String> {
+        let (prompt, suffix) = split_fim_prompt(prompt);
         let request = FIMRequest {
-            prompt: parts[0].to_owned(),
-            suffix: parts
-                .get(1)
-                .map(|x| x.to_string())
-                .filter(|x| !x.is_empty()),
+            prompt: prompt.to_owned(),
+            suffix: suffix.map(|x| x.to_owned()),
             model: self.model_name.clone(),
             max_tokens: options.max_decoding_tokens,
             temperature: options.sampling_temperature,

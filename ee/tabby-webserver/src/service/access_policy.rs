@@ -57,3 +57,15 @@ impl AccessPolicyService for AccessPolicyServiceImpl {
 pub fn create(db: DbConn, context: Arc<dyn ContextService>) -> impl AccessPolicyService {
     AccessPolicyServiceImpl { db, context }
 }
+
+#[cfg(test)]
+pub mod testutils {
+    use tabby_schema::policy::AccessPolicy;
+
+    use super::*;
+
+    /// create a mock `AccessPolicy` for testing with admin permissions
+    pub async fn make_policy(db: DbConn) -> AccessPolicy {
+        AccessPolicy::new(db.clone(), &ID::from("nihao".to_string()), true)
+    }
+}

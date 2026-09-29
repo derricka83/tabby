@@ -18,6 +18,7 @@
 
     --border: 38 8.1% 90%;
     --input: 38 8.1% 90%;
+    --input-border: 38 8.1% 90%;
 
     --primary: 38 31% 25%;
     --primary-foreground: 38 0.62% 92.5%;
@@ -39,6 +40,8 @@
     --radius: 0.5rem;
 
     --selection: 200, 100%, 90%;
+
+    --link: 38, 44%, 41%;
   }
 
   .dark {
@@ -56,6 +59,7 @@
 
     --border: 39 9% 17%;
     --input: 39 16% 26.1%;
+    --input-border: 39 16% 26.1%;
 
     --primary: 39 32% 87%;
     --primary-foreground: 39 3.2% 8.7%;
@@ -75,6 +79,8 @@
     --ring: 39 32% 87%;
 
     --selection: 221, 13%, 28%;
+
+    --link: 37, 34%, 57%;
   }
 }
 
@@ -100,10 +106,17 @@
   display: none;
 }
 
-[data-aos][data-aos=fade-down] {
-  transform: translate3d(0, -20px, 0);
+.unread-notification::before {
+  @apply content-[''] float-left w-2 h-2 mr-1.5 mt-2 rounded-full bg-red-400;
 }
 
-[data-aos][data-aos=fade-up] {
-  transform: translate3d(0, 20px, 0);
+/* Tiptap editor */
+.tiptap:first-child {
+  @apply mt-0;
 }
+
+.tiptap p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  @apply text-muted-foreground cursor-text h-0 float-left;
+}
+/* Tiptap editor */
